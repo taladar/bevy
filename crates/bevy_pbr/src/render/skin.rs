@@ -27,6 +27,19 @@ use tracing::error;
 /// of the GPU at runtime, which would mean not using consts anymore.
 pub const MAX_JOINTS: usize = 256;
 
+/// Marks a [`SkinnedMesh`] whose joint matrices are written into the skin
+/// palette buffer by something other than [`extract_skins`] — e.g. a compute
+/// shader that overwrites [`SkinUniforms::current_buffer`] in place every frame.
+///
+/// Such a skin still participates in **allocation** (`add_or_delete_skins`
+/// keeps running, so it gets a stable palette slot and its `current_skin_index`
+/// stays valid), but [`extract_skins`] skips the per-frame per-joint transform
+/// gather for it — that work would only stage matrices the external writer
+/// immediately overwrites. Skipping it removes `extract_skins`' non-cullable,
+/// iterate-every-skin floor for externally posed skins.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ExternallyPosedSkin;
+
 /// The total number of joints we support.
 ///
 /// This is 256 GiB worth of joint matrices, which we will never hit under any
@@ -271,7 +284,11 @@ pub fn prepare_skins(
 // in the shader that you only read the values that are valid for that binding.
 pub fn extract_skins(
     skin_uniforms: ResMut<SkinUniforms>,
-    skinned_meshes: Extract<Query<(Entity, &SkinnedMesh)>>,
+    // The per-frame joint gather skips skins whose palettes are written
+    // externally (e.g. by a compute shader), while `changed_skinned_meshes`
+    // below is left unfiltered so those skins are still allocated and keep a
+    // valid `current_skin_index`. See [`ExternallyPosedSkin`].
+    skinned_meshes: Extract<Query<(Entity, &SkinnedMesh), Without<ExternallyPosedSkin>>>,
     changed_skinned_meshes: Extract<
         Query<
             (Entity, &ViewVisibility, &SkinnedMesh),
