@@ -1,10 +1,7 @@
 use bevy_asset::Handle;
 use bevy_camera::{
     primitives::{CascadesFrusta, Frustum},
-    visibility::{
-        self, CascadesStaticVisibleEntities, CascadesVisibleEntities, ViewVisibility, Visibility,
-        VisibilityClass,
-    },
+    visibility::{self, CascadesVisibleEntities, ViewVisibility, Visibility, VisibilityClass},
     Camera,
 };
 use bevy_color::Color;
@@ -17,7 +14,6 @@ use tracing::warn;
 
 use super::{
     cascade::CascadeShadowConfig, cluster::ClusterVisibilityClass, light_consts, Cascades,
-    StaticCascades,
 };
 
 /// A Directional light.
@@ -69,12 +65,6 @@ use super::{
     CascadesFrusta,
     CascadeShadowConfig,
     CascadesVisibleEntities,
-    // sl-client fork (cached-static-shadow-map): the static-caster subset, empty
-    // unless the viewer enables the cached-static shadow feature.
-    CascadesStaticVisibleEntities,
-    // sl-client fork (cached-static-shadow-map, scope 2): the retained static
-    // cascade projections, persisted across frames.
-    StaticCascades,
     Transform,
     Visibility,
     VisibilityClass

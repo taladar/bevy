@@ -191,167 +191,6 @@ pub struct Cascade {
     pub texel_size: f32,
 }
 
-/// sl-client fork (cached-static-shadow-map, scope 2): coverage margin for the
-/// retained *static* shadow cascade. The static map covers this multiple of the
-/// dynamic cascade's diameter (and depth range) so the camera can pan within the
-/// margin before the static map has to be re-baked. Larger values re-bake less
-/// often at the cost of coarser static texels.
-const STATIC_CASCADE_MARGIN: f32 = 1.5;
-
-/// sl-client fork (cached-static-shadow-map, scope 2): the *retained* projection
-/// for one cascade's static shadow layer.
-///
-/// Unlike [`Cascade`], which is rebuilt every frame to texel-snap onto the moving
-/// camera, a `StaticCascade` is **persistent**: it is baked once and reused across
-/// frames while the camera stays inside its (margin-expanded) coverage. The
-/// shader samples the static depth layer with [`Self::clip_from_world`] — *not* the
-/// live per-frame cascade projection — so the retained depths stay aligned with
-/// the sample as the camera moves. It is only rebuilt (and the layer re-baked)
-/// when the dynamic cascade's coverage would leave the retained coverage, or the
-/// light direction changes.
-#[derive(Clone, Debug, Reflect)]
-#[reflect(Clone)]
-pub struct StaticCascade {
-    /// The static cascade's view-to-world matrix.
-    pub world_from_cascade: Mat4,
-    /// The static cascade's orthographic projection.
-    pub clip_from_cascade: Mat4,
-    /// World space into static-cascade light clip space; the shader samples the
-    /// retained static layer with this.
-    pub clip_from_world: Mat4,
-    /// Size of each static-cascade shadow map texel in world units (coarser than
-    /// the dynamic cascade by roughly [`STATIC_CASCADE_MARGIN`]).
-    pub texel_size: f32,
-    /// The light-space axis-aligned coverage this static cascade was built for,
-    /// kept so the next frame can test whether the dynamic cascade still fits.
-    pub light_space_min: Vec3A,
-    /// The far corner of the light-space coverage (see [`Self::light_space_min`]).
-    pub light_space_max: Vec3A,
-    /// The light basis (`world_from_light`) this was built with; a change in sun
-    /// direction rotates light space and forces a rebuild.
-    pub world_from_light: Mat4,
-    /// Whether the static depth layer must be re-baked this frame (the projection
-    /// was just rebuilt). When false the retained layer is reused untouched.
-    pub dirty: bool,
-}
-
-/// sl-client fork (cached-static-shadow-map, scope 2): a [`DirectionalLight`]'s
-/// per-view list of retained [`StaticCascade`]s, persisted across frames (unlike
-/// [`Cascades`], which is cleared and rebuilt every frame).
-#[derive(Component, Clone, Debug, Default, Reflect)]
-#[reflect(Component, Debug, Default, Clone)]
-pub struct StaticCascades {
-    /// Map from a view to the retained static cascade of each of its cascades.
-    pub cascades: EntityHashMap<Vec<StaticCascade>>,
-}
-
-/// sl-client fork (cached-static-shadow-map, scope 2): build (or reuse) the
-/// retained static cascade for one cascade slice.
-///
-/// Mirrors [`calculate_cascade`], but expands the coverage by
-/// [`STATIC_CASCADE_MARGIN`] and reuses `previous` (leaving it `dirty == false`)
-/// while the current dynamic coverage still fits inside the retained coverage and
-/// the light direction is unchanged. Only when the fit is lost is a fresh,
-/// texel-snapped static projection built and marked `dirty`.
-fn calculate_static_cascade(
-    frustum_corners: [Vec3A; 8],
-    cascade_texture_size: f32,
-    world_from_light: Mat4,
-    light_from_camera: Mat4,
-    previous: Option<&StaticCascade>,
-) -> StaticCascade {
-    let mut min = Vec3A::splat(f32::MAX);
-    let mut max = Vec3A::splat(f32::MIN);
-    for corner_camera_view in frustum_corners {
-        let corner_light_view = light_from_camera.transform_point3a(corner_camera_view);
-        min = min.min(corner_light_view);
-        max = max.max(corner_light_view);
-    }
-
-    // The dynamic cascade's light-space coverage this frame. If it still fits the
-    // retained static coverage and the light has not rotated, reuse the retained
-    // projection so the static layer stays valid without a re-bake.
-    if let Some(prev) = previous {
-        let same_light = prev.world_from_light.abs_diff_eq(world_from_light, 1e-5);
-        let fits = min.cmpge(prev.light_space_min).all() && max.cmple(prev.light_space_max).all();
-        if same_light && fits {
-            let mut reused = prev.clone();
-            reused.dirty = false;
-            return reused;
-        }
-    }
-
-    // Rebuild: a fresh static projection centered on the current slice, expanded
-    // by the margin so the camera can move before the next rebuild.
-    let body_diagonal = (frustum_corners[0] - frustum_corners[6]).length_squared();
-    let far_plane_diagonal = (frustum_corners[4] - frustum_corners[6]).length_squared();
-    let dynamic_diameter = body_diagonal.max(far_plane_diagonal).sqrt().ceil();
-    let cascade_diameter = (dynamic_diameter * STATIC_CASCADE_MARGIN).ceil();
-    let cascade_texel_size = cascade_diameter / cascade_texture_size;
-
-    // Expand the depth range symmetrically by the same margin so casters just in
-    // front of / behind the slice stay covered as the camera moves.
-    let z_margin = 0.5 * (max.z - min.z) * (STATIC_CASCADE_MARGIN - 1.0);
-    let near_z = max.z + z_margin;
-    let far_z = min.z - z_margin;
-
-    // Texel-snap the center (as [`calculate_cascade`] does) so the retained map is
-    // itself shimmer-free when it is baked.
-    let near_plane_center = Vec3A::new(
-        (0.5 * (min.x + max.x) / cascade_texel_size).floor() * cascade_texel_size,
-        (0.5 * (min.y + max.y) / cascade_texel_size).floor() * cascade_texel_size,
-        near_z,
-    );
-
-    let world_from_light_transpose = world_from_light.transpose();
-    let cascade_from_world = Mat4::from_cols(
-        world_from_light_transpose.x_axis,
-        world_from_light_transpose.y_axis,
-        world_from_light_transpose.z_axis,
-        (-near_plane_center).extend(1.0),
-    );
-    let world_from_cascade = Mat4::from_cols(
-        world_from_light.x_axis,
-        world_from_light.y_axis,
-        world_from_light.z_axis,
-        world_from_light * near_plane_center.extend(1.0),
-    );
-
-    let r = (near_z - far_z).recip();
-    let clip_from_cascade = Mat4::from_cols(
-        Vec4::new(2.0 / cascade_diameter, 0.0, 0.0, 0.0),
-        Vec4::new(0.0, 2.0 / cascade_diameter, 0.0, 0.0),
-        Vec4::new(0.0, 0.0, r, 0.0),
-        Vec4::new(0.0, 0.0, 1.0, 1.0),
-    );
-    let clip_from_world = clip_from_cascade * cascade_from_world;
-
-    // The light-space coverage the retained map now spans (used next frame for
-    // the fit test): the snapped square in x/y and the margin-expanded depth.
-    let half = 0.5 * cascade_diameter;
-    let light_space_min = Vec3A::new(
-        near_plane_center.x - half,
-        near_plane_center.y - half,
-        far_z,
-    );
-    let light_space_max = Vec3A::new(
-        near_plane_center.x + half,
-        near_plane_center.y + half,
-        near_z,
-    );
-
-    StaticCascade {
-        world_from_cascade,
-        clip_from_cascade,
-        clip_from_world,
-        texel_size: cascade_texel_size,
-        light_space_min,
-        light_space_max,
-        world_from_light,
-        dirty: true,
-    }
-}
-
 /// Sets up [`Cascades`] for all shadow mapped [`DirectionalLight`]s.
 pub fn build_directional_light_cascades(
     directional_light_shadow_map: Res<DirectionalLightShadowMap>,
@@ -361,9 +200,6 @@ pub fn build_directional_light_cascades(
         &DirectionalLight,
         &CascadeShadowConfig,
         &mut Cascades,
-        // sl-client fork (cached-static-shadow-map, scope 2): the retained static
-        // projections, persisted across frames alongside the per-frame cascades.
-        &mut StaticCascades,
     )>,
 ) {
     let views = views
@@ -377,18 +213,11 @@ pub fn build_directional_light_cascades(
         })
         .collect::<Vec<_>>();
 
-    for (transform, directional_light, cascades_config, mut cascades, mut static_cascades) in
-        &mut lights
-    {
+    for (transform, directional_light, cascades_config, mut cascades) in &mut lights {
         if !directional_light.shadow_maps_enabled {
             continue;
         }
         cascades.cascades.clear();
-        // sl-client fork (cached-static-shadow-map, scope 2): the retained static
-        // projections persist across frames, so rather than clearing we take the
-        // previous map out and read each view's prior state back when rebuilding.
-        // Views that vanished simply drop out (they are not re-inserted).
-        let previous_static = core::mem::take(&mut static_cascades.cascades);
 
         // It is very important to the numerical and thus visual stability of shadows that
         // `world_from_light` has orthogonal upper-left 3x3 and zero translation.
@@ -407,64 +236,20 @@ pub fn build_directional_light_cascades(
             let near_bounds = [cascades_config.minimum_distance]
                 .into_iter()
                 .chain(far_bounds.clone().map(|bound| overlap_factor * bound));
-            // sl-client fork (cached-static-shadow-map, scope 2): the retained
-            // static projection for each cascade, reusing this view's prior state
-            // for the coverage-fit test.
-            let previous_view_static = previous_static.get(&view_entity);
-            let bounds: Vec<(f32, f32)> =
-                near_bounds.zip(far_bounds).map(|(near, far)| (near, *far)).collect();
-            let mut view_cascades = Vec::with_capacity(bounds.len());
-            let mut view_static_cascades = Vec::with_capacity(bounds.len());
-            let mut cascade_corners = Vec::with_capacity(bounds.len());
-            for (cascade_index, (near_bound, far_bound)) in bounds.iter().copied().enumerate() {
-                // Negate bounds as -z is camera forward direction.
-                let corners = projection.get_frustum_corners(-near_bound, -far_bound);
-                cascade_corners.push(corners);
-                view_static_cascades.push(calculate_static_cascade(
-                    corners,
-                    directional_light_shadow_map.size as f32,
-                    world_from_light,
-                    light_view_from_camera,
-                    previous_view_static.and_then(|prev| prev.get(cascade_index)),
-                ));
-                view_cascades.push(calculate_cascade(
-                    corners,
-                    directional_light_shadow_map.size as f32,
-                    world_from_light,
-                    light_view_from_camera,
-                ));
-            }
-
-            // sl-client fork (cached-static-shadow-map): synchronize static
-            // re-bakes across a view's cascades. If ANY cascade's retained
-            // projection was rebuilt this frame, rebuild the rest too (forcing
-            // `previous = None`), so all cascades share one projection age and
-            // re-bake on the same frame (the bake gate in `prepare_lights` bakes
-            // every `dirty` cascade). Independent per-cascade rebuilds otherwise
-            // leave adjacent static cascades culled against different-age frusta,
-            // which shows as shadow seams that flicker as the camera moves and as
-            // casters that vanish on one side of a cascade boundary. The cost — a
-            // cascade that still fit is rebuilt early — is accepted: consistency
-            // across the static cascades matters more than squeezing the last
-            // frames out of each margin.
-            if view_static_cascades.iter().any(|cascade| cascade.dirty) {
-                for (cascade_index, cascade) in view_static_cascades.iter_mut().enumerate() {
-                    if !cascade.dirty {
-                        *cascade = calculate_static_cascade(
-                            cascade_corners[cascade_index],
-                            directional_light_shadow_map.size as f32,
-                            world_from_light,
-                            light_view_from_camera,
-                            None,
-                        );
-                    }
-                }
-            }
-
+            let view_cascades = near_bounds
+                .zip(far_bounds)
+                .map(|(near_bound, far_bound)| {
+                    // Negate bounds as -z is camera forward direction.
+                    let corners = projection.get_frustum_corners(-near_bound, -far_bound);
+                    calculate_cascade(
+                        corners,
+                        directional_light_shadow_map.size as f32,
+                        world_from_light,
+                        light_view_from_camera,
+                    )
+                })
+                .collect();
             cascades.cascades.insert(view_entity, view_cascades);
-            static_cascades
-                .cascades
-                .insert(view_entity, view_static_cascades);
         }
     }
 }
@@ -546,98 +331,5 @@ fn calculate_cascade(
         clip_from_cascade,
         clip_from_world,
         texel_size: cascade_texel_size,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Eight corners of an axis-aligned cube centered at `center`, in the corner
-    /// order `calculate_*_cascade` expects (near bottom-right, top-right, top-left,
-    /// bottom-left; then the same four for the far plane).
-    fn cube_corners(center: Vec3A, half: f32) -> [Vec3A; 8] {
-        [
-            center + Vec3A::new(half, -half, half),
-            center + Vec3A::new(half, half, half),
-            center + Vec3A::new(-half, half, half),
-            center + Vec3A::new(-half, -half, half),
-            center + Vec3A::new(half, -half, -half),
-            center + Vec3A::new(half, half, -half),
-            center + Vec3A::new(-half, half, -half),
-            center + Vec3A::new(-half, -half, -half),
-        ]
-    }
-
-    /// The retained static cascade is reused (not `dirty`, same projection) while
-    /// the camera stays inside the margin, and rebuilt once it leaves.
-    #[test]
-    fn static_cascade_reused_within_margin_rebuilt_beyond() {
-        let size = 4096.0;
-        let light = Mat4::IDENTITY;
-        let corners = cube_corners(Vec3A::ZERO, 5.0);
-
-        // First build: no previous → a fresh bake.
-        let first = calculate_static_cascade(corners, size, light, light, None);
-        assert!(first.dirty, "a fresh static cascade must bake");
-
-        // Unchanged coverage → reused, not dirty, identical projection.
-        let again = calculate_static_cascade(corners, size, light, light, Some(&first));
-        assert!(
-            !again.dirty,
-            "unchanged coverage must reuse the retained bake"
-        );
-        assert_eq!(again.clip_from_world, first.clip_from_world);
-
-        // A small move (well inside the margin) still fits → reused.
-        let nudged = cube_corners(Vec3A::new(1.0, 0.0, 0.0), 5.0);
-        let small = calculate_static_cascade(nudged, size, light, light, Some(&first));
-        assert!(!small.dirty, "a move within the margin must reuse the bake");
-        assert_eq!(small.clip_from_world, first.clip_from_world);
-
-        // A large move leaves the coverage → rebuilt with a new projection.
-        let far = cube_corners(Vec3A::new(100.0, 0.0, 0.0), 5.0);
-        let rebuilt = calculate_static_cascade(far, size, light, light, Some(&first));
-        assert!(
-            rebuilt.dirty,
-            "a move beyond the margin must rebuild the bake"
-        );
-        assert_ne!(rebuilt.clip_from_world, first.clip_from_world);
-    }
-
-    /// A change in sun direction rotates light space and forces a rebuild even
-    /// when the camera-space coverage is unchanged.
-    #[test]
-    fn static_cascade_rebuilt_when_light_rotates() {
-        let size = 4096.0;
-        let light = Mat4::IDENTITY;
-        let corners = cube_corners(Vec3A::ZERO, 5.0);
-        let first = calculate_static_cascade(corners, size, light, light, None);
-
-        let rotated = Mat4::from_rotation_y(0.5);
-        let after = calculate_static_cascade(corners, size, rotated, light, Some(&first));
-        assert!(
-            after.dirty,
-            "a sun rotation must rebuild the static cascade"
-        );
-    }
-
-    /// The static cascade covers a strictly larger light-space area than the
-    /// dynamic cascade fit to the same frustum slice (the margin), so a static
-    /// caster just outside the dynamic cascade still lands in the retained bake.
-    #[test]
-    fn static_cascade_is_larger_than_dynamic() {
-        let size = 4096.0;
-        let light = Mat4::IDENTITY;
-        let corners = cube_corners(Vec3A::ZERO, 5.0);
-
-        let dynamic = calculate_cascade(corners, size, light, light);
-        let stat = calculate_static_cascade(corners, size, light, light, None);
-        assert!(
-            stat.texel_size > dynamic.texel_size,
-            "the margin-expanded static cascade must have coarser texels ({} vs {})",
-            stat.texel_size,
-            dynamic.texel_size,
-        );
     }
 }

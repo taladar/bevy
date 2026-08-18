@@ -212,12 +212,6 @@ impl Plugin for PbrPlugin {
 
         app.register_asset_reflect::<StandardMaterial>()
             .init_resource::<DefaultOpaqueRendererMethod>()
-            // sl-client fork (cached-static-shadow-map): main-world config,
-            // extracted to the render app. Defaults to disabled = stock Bevy.
-            // (Its own `add_plugins` call — the tuple below is already at Bevy's
-            // 15-plugin `Plugins` impl limit for some feature sets.)
-            .init_resource::<CachedStaticShadows>()
-            .add_plugins(ExtractResourcePlugin::<CachedStaticShadows>::default())
             .add_plugins((
                 MeshRenderPlugin {
                     use_gpu_instance_buffer_builder: self.use_gpu_instance_buffer_builder,

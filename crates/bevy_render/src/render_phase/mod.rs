@@ -966,35 +966,6 @@ where
             phase_type = BinnedRenderPhaseType::BatchableMesh;
         }
 
-        // sl-client fork (cached-static-shadow-map): make `add` an upsert. If this
-        // entity is already binned under a DIFFERENT key, remove it from its old
-        // bin first so it does not linger there in two bins. If the key is
-        // identical, the insert below just refreshes its instance index. This lets
-        // the retained static shadow phase re-queue a caster whose material was
-        // re-specialized to the SAME shadow pipeline (a texture-LOD swap is
-        // depth-irrelevant) without moving it, while a genuine pipeline change (a
-        // transparency / alpha-mode change) still relocates it. Callers that
-        // already `remove` before `add` are unaffected (the cache entry is gone).
-        if let Some(old_key) = self
-            .cached_entity_bin_keys
-            .get(&main_entity)
-            .and_then(|cached| cached.cached_bin_key.clone())
-        {
-            if old_key.batch_set_key != batch_set_key
-                || old_key.bin_key != bin_key
-                || old_key.phase_type != phase_type
-            {
-                remove_entity_from_bin(
-                    main_entity,
-                    &old_key,
-                    &mut self.multidrawable_meshes,
-                    &mut self.batchable_meshes,
-                    &mut self.unbatchable_meshes,
-                    &mut self.non_mesh_items,
-                );
-            }
-        }
-
         match phase_type {
             BinnedRenderPhaseType::MultidrawableMesh => {
                 match self.multidrawable_meshes.entry(batch_set_key.clone()) {
@@ -1341,20 +1312,6 @@ where
         for unbatchable_bin in self.unbatchable_meshes.values_mut() {
             unbatchable_bin.buffer_indices.clear();
         }
-    }
-
-    /// sl-client fork (cached-static-shadow-map) diagnostics: the number of
-    /// entities currently binned in this phase — what a render of it would draw.
-    /// Used to observe the retained static shadow bins under the live viewer.
-    pub fn binned_entity_count(&self) -> usize {
-        self.cached_entity_bin_keys.len()
-    }
-
-    /// sl-client fork (cached-static-shadow-map) diagnostics: whether `main_entity`
-    /// is currently binned (would be drawn). Used to find which *visible* casters
-    /// are missing from the retained bins, and whether that set rotates.
-    pub fn is_binned(&self, main_entity: MainEntity) -> bool {
-        self.cached_entity_bin_keys.contains_key(&main_entity)
     }
 
     /// Removes a single entity from its bin.

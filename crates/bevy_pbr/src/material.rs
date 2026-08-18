@@ -295,9 +295,6 @@ impl Plugin for MaterialsPlugin {
                 .init_gpu_resource::<SpecializedMeshPipelines<MaterialPipelineSpecializer>>()
                 .init_gpu_resource::<LightKeyCache>()
                 .init_gpu_resource::<SpecializedShadowMaterialPipelineCache>()
-                // sl-client fork (cached-static-shadow-map, scope 2): the
-                // per-frame set of baking static subviews.
-                .init_resource::<StaticShadowBakes>()
                 .init_resource::<DrawFunctions<Shadow>>()
                 .init_resource::<RenderMaterialInstances>()
                 .allow_ambiguous_resource::<RenderMaterialInstances>()

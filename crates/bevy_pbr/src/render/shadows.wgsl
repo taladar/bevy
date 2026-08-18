@@ -148,16 +148,15 @@ fn get_cascade_index(light_id: u32, view_z: f32) -> u32 {
 //
 // The depth is stored in the return value's z coordinate. If the return value's
 // w coordinate is 0.0, then we landed outside the shadow map entirely.
-// sl-client fork (cached-static-shadow-map, scope 2): project a world-space
-// position into a cascade's shadow-map local space with an explicit
-// world→clip matrix. Shared by the per-frame dynamic layer and the retained
-// static layer, which use *different* projections. Returns `vec4(0.0)` (w == 0)
-// when the position falls outside the projection volume.
-fn project_directional_light_local(
-    clip_from_world: mat4x4<f32>,
-    offset_position: vec4<f32>,
+fn world_to_directional_light_local(
+    light_id: u32,
+    cascade_index: u32,
+    offset_position: vec4<f32>
 ) -> vec4<f32> {
-    let offset_position_clip = clip_from_world * offset_position;
+    let light = &view_bindings::lights.directional_lights[light_id];
+    let cascade = &(*light).cascades[cascade_index];
+
+    let offset_position_clip = (*cascade).clip_from_world * offset_position;
     if (offset_position_clip.w <= 0.0) {
         return vec4(0.0);
     }
@@ -178,16 +177,6 @@ fn project_directional_light_local(
     return vec4(light_local, depth, 1.0);
 }
 
-fn world_to_directional_light_local(
-    light_id: u32,
-    cascade_index: u32,
-    offset_position: vec4<f32>
-) -> vec4<f32> {
-    let light = &view_bindings::lights.directional_lights[light_id];
-    let cascade = &(*light).cascades[cascade_index];
-    return project_directional_light_local((*cascade).clip_from_world, offset_position);
-}
-
 fn sample_directional_cascade(
     light_id: u32,
     cascade_index: u32,
@@ -198,89 +187,38 @@ fn sample_directional_cascade(
     let light = &view_bindings::lights.directional_lights[light_id];
     let cascade = &(*light).cascades[cascade_index];
 
+    // The normal bias is scaled to the texel size.
+    let normal_offset = (*light).shadow_normal_bias * (*cascade).texel_size * surface_normal.xyz;
     let depth_offset = (*light).shadow_depth_bias * (*light).direction_to_light.xyz;
-
-    // sl-client fork (cached-static-shadow-map): a cascade's dynamic layer sits
-    // at `base + stride * cascade_index`; when the stride is 2 the retained
-    // static layer sits one beyond it. Stock Bevy uses stride 1 and samples a
-    // single layer.
-    let stride = (*light).cascade_layer_stride;
-    let dynamic_index = i32((*light).depth_texture_base_index + stride * cascade_index);
-    let texel_size = (*cascade).texel_size;
-
-    // Dynamic layer: sampled with the per-frame cascade projection. The normal
-    // bias is scaled to the texel size.
-    let normal_offset = (*light).shadow_normal_bias * texel_size * surface_normal.xyz;
     let offset_position = vec4<f32>(frag_position.xyz + normal_offset + depth_offset, frag_position.w);
-    let light_local = project_directional_light_local((*cascade).clip_from_world, offset_position);
 
-    // Static layer (scope 2): sampled with the *retained* static projection —
-    // decoupled from the moving camera so cached depths stay aligned. Its texel
-    // size (coarser) scales its own normal bias.
-    let static_texel_size = (*cascade).static_texel_size;
-    let static_normal_offset = (*light).shadow_normal_bias * static_texel_size * surface_normal.xyz;
-    let static_offset_position =
-        vec4<f32>(frag_position.xyz + static_normal_offset + depth_offset, frag_position.w);
-    let static_light_local =
-        project_directional_light_local((*cascade).static_clip_from_world, static_offset_position);
+    let light_local = world_to_directional_light_local(light_id, cascade_index, offset_position);
+    if (light_local.w == 0.0) {
+        return 1.0;
+    }
+
+    let array_index = i32((*light).depth_texture_base_index + cascade_index);
+    let texel_size = (*cascade).texel_size;
 
     // If soft shadows are enabled, use the PCSS path.
     if ((*light).soft_shadow_size > 0.0) {
-        var dynamic_shadow = 1.0;
-        if (light_local.w != 0.0) {
-            dynamic_shadow = sample_shadow_map_pcss(
-                light_local.xy,
-                light_local.z,
-                dynamic_index,
-                frag_coord_xy,
-                texel_size,
-                (*light).soft_shadow_size,
-            );
-        }
-        if (stride < 2u) {
-            return dynamic_shadow;
-        }
-        var static_shadow = 1.0;
-        if (static_light_local.w != 0.0) {
-            static_shadow = sample_shadow_map_pcss(
-                static_light_local.xy,
-                static_light_local.z,
-                dynamic_index + 1,
-                frag_coord_xy,
-                static_texel_size,
-                (*light).soft_shadow_size,
-            );
-        }
-        // Nearer occluder wins: a fragment is shadowed if either the dynamic or
-        // the retained static casters occlude it, so the visibility is the min.
-        return min(dynamic_shadow, static_shadow);
-    }
-
-    var dynamic_shadow = 1.0;
-    if (light_local.w != 0.0) {
-        dynamic_shadow = sample_shadow_map(
+        return sample_shadow_map_pcss(
             light_local.xy,
             light_local.z,
-            dynamic_index,
+            array_index,
             frag_coord_xy,
             texel_size,
+            (*light).soft_shadow_size,
         );
     }
-    if (stride < 2u) {
-        return dynamic_shadow;
-    }
-    var static_shadow = 1.0;
-    if (static_light_local.w != 0.0) {
-        static_shadow = sample_shadow_map(
-            static_light_local.xy,
-            static_light_local.z,
-            dynamic_index + 1,
-            frag_coord_xy,
-            static_texel_size,
-        );
-    }
-    // Nearer occluder wins (see the PCSS branch above).
-    return min(dynamic_shadow, static_shadow);
+
+    return sample_shadow_map(
+        light_local.xy,
+        light_local.z,
+        array_index,
+        frag_coord_xy,
+        texel_size,
+    );
 }
 
 fn fetch_directional_shadow(
