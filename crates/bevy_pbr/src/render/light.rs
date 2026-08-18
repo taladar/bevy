@@ -5,8 +5,8 @@ use bevy_camera::primitives::{
     face_index_to_name, CascadesFrusta, CubeMapFace, CubemapFrusta, Frustum, CUBE_MAP_FACES,
 };
 use bevy_camera::visibility::{
-    CascadesVisibleEntities, CubemapVisibleEntities, RenderLayers, ViewVisibility,
-    VisibleMeshEntities,
+    CascadesStaticVisibleEntities, CascadesVisibleEntities, CubemapVisibleEntities, RenderLayers,
+    ViewVisibility, VisibleMeshEntities,
 };
 use bevy_camera::{Camera, Camera3d, RenderTarget, ShadowLodOrigin};
 use bevy_color::ColorToComponents;
@@ -27,6 +27,7 @@ use bevy_light::{
     Cascades, DirectionalLight, DirectionalLightShadowMap, GlobalAmbientLight, PointLight,
     PointLightShadowMap, RectLight, ShadowFilteringMethod, SpotLight, VolumetricLight,
 };
+use bevy_light::{StaticCascade, StaticCascades};
 use bevy_material::{
     key::{ErasedMaterialPipelineKey, ErasedMeshPipelineKey},
     MaterialProperties,
@@ -53,6 +54,7 @@ use bevy_render::view::{
 use bevy_render::{
     batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
     camera::SortedCameras,
+    extract_resource::ExtractResource,
     mesh::allocator::MeshAllocator,
     view::{NoIndirectDrawing, RetainedViewEntity},
 };
@@ -120,6 +122,9 @@ pub struct ExtractedDirectionalLight {
     pub shadow_normal_bias: f32,
     pub cascade_shadow_config: CascadeShadowConfig,
     pub cascades: EntityHashMap<Vec<Cascade>>,
+    // sl-client fork (cached-static-shadow-map, scope 2): the retained static
+    // cascade projections, sampled by the static depth layer.
+    pub static_cascades: EntityHashMap<Vec<StaticCascade>>,
     pub frusta: EntityHashMap<Vec<Frustum>>,
     pub render_layers: RenderLayers,
     pub soft_shadow_size: Option<f32>,
@@ -147,7 +152,17 @@ bitflags::bitflags! {
 #[derive(Copy, Clone, ShaderType, Default, Debug)]
 pub struct GpuDirectionalCascade {
     clip_from_world: Mat4,
+    // sl-client fork (cached-static-shadow-map, scope 2): the retained static
+    // cascade's world→clip projection. The shader samples the static depth layer
+    // with this (not `clip_from_world`), so the cached depths stay aligned with
+    // the sample as the camera moves. Equals `clip_from_world` when the static
+    // stride is 1 (feature off).
+    static_clip_from_world: Mat4,
     texel_size: f32,
+    // sl-client fork (cached-static-shadow-map, scope 2): the static cascade's
+    // texel size (coarser than `texel_size`), used to scale the static sample's
+    // normal bias.
+    static_texel_size: f32,
     far_bound: f32,
 }
 
@@ -166,6 +181,12 @@ pub struct GpuDirectionalLight {
     decal_index: u32,
     sun_disk_angular_size: f32,
     sun_disk_intensity: f32,
+    // sl-client fork (cached-static-shadow-map): per-cascade depth-layer stride
+    // (1 = stock single layer per cascade; 2 = dynamic layer + retained static
+    // layer). The shader reads a cascade's dynamic layer at
+    // `depth_texture_base_index + cascade_layer_stride * cascade_index`, and its
+    // static layer one beyond, and samples both when the stride is 2.
+    cascade_layer_stride: u32,
 }
 
 // NOTE: These must match the bit flags in bevy_pbr/src/render/mesh_view_types.wgsl!
@@ -230,6 +251,50 @@ pub const MAX_CASCADES_PER_LIGHT: usize = 4;
 pub const MAX_CASCADES_PER_LIGHT: usize = 1;
 
 pub const MAX_RECT_LIGHTS: usize = 8;
+
+/// sl-client fork (cached-static-shadow-map): render-app configuration for the
+/// cached static sun-shadow map. Extracted from the main world each frame.
+///
+/// Each directional cascade is backed by **two** depth layers: a per-frame
+/// *dynamic* layer (even) and a retained *static* layer (odd). The static layer
+/// is (re-)rendered only on the frames the viewer marks
+/// [`bake_static`](Self::bake_static); otherwise it is left untouched so its
+/// last bake is reused. `shadows.wgsl` samples both layers and takes the nearer
+/// occluder.
+#[derive(Resource, Clone, Copy, Debug, Default, ExtractResource)]
+pub struct CachedStaticShadows {
+    /// Whether to (re-)bake the static casters this frame. When true a static
+    /// shadow subview is created per cascade and rendered into the retained
+    /// static layer; when false the static layers are left untouched.
+    pub bake_static: bool,
+}
+
+/// sl-client fork (cached-static-shadow-map, scope 2): the retained static
+/// subviews re-baked this frame.
+///
+/// Populated in [`prepare_lights`] (per cascade: the static projection was
+/// rebuilt, or the viewer's static caster set changed) and consumed in
+/// [`check_views_lights_need_specialization`], which force-requeues exactly these
+/// subviews so a bake renders the complete static set rather than the binned
+/// phase's incremental delta. Render-world only; not extracted.
+#[derive(Resource, Default)]
+pub struct StaticShadowBakes {
+    /// The static subviews (by retained-view identity) baked this frame.
+    pub views: HashSet<RetainedViewEntity>,
+}
+
+/// sl-client fork (cached-static-shadow-map): the `RetainedViewEntity`
+/// subview-index offset that distinguishes a cascade's retained *static* shadow
+/// subview from its per-frame *dynamic* subview (which keeps the stock
+/// `subview_index == cascade_index`). Larger than any cascade index, so the two
+/// never collide within a light.
+pub(crate) const DIRECTIONAL_STATIC_SUBVIEW_OFFSET: u32 = MAX_CASCADES_PER_LIGHT as u32;
+
+/// sl-client fork (cached-static-shadow-map): the per-cascade depth-layer stride.
+/// The cached-static path always packs two layers per cascade (dynamic even,
+/// static odd), so the shader steps by this to find a cascade's dynamic layer
+/// and adds one for its static layer.
+pub(crate) const CASCADE_LAYER_STRIDE: u32 = 2;
 
 #[derive(Resource, Clone)]
 pub struct ShadowSamplers {
@@ -371,7 +436,13 @@ pub fn extract_lights(
                 RenderEntity,
                 &DirectionalLight,
                 &CascadesVisibleEntities,
+                // sl-client fork (cached-static-shadow-map): the static-caster
+                // subset, baked into the retained static shadow layer.
+                &CascadesStaticVisibleEntities,
                 &Cascades,
+                // sl-client fork (cached-static-shadow-map, scope 2): the retained
+                // static cascade projections.
+                &StaticCascades,
                 &CascadeShadowConfig,
                 &CascadesFrusta,
                 &GlobalTransform,
@@ -386,7 +457,11 @@ pub fn extract_lights(
                 Or<(
                     Changed<DirectionalLight>,
                     Changed<CascadesVisibleEntities>,
+                    // sl-client fork (cached-static-shadow-map).
+                    Changed<CascadesStaticVisibleEntities>,
                     Changed<Cascades>,
+                    // sl-client fork (cached-static-shadow-map, scope 2).
+                    Changed<StaticCascades>,
                     Changed<CascadeShadowConfig>,
                     Changed<CascadesFrusta>,
                     Changed<GlobalTransform>,
@@ -672,7 +747,9 @@ pub fn extract_lights(
         entity,
         directional_light,
         visible_entities,
+        static_visible_entities,
         cascades,
+        static_cascades,
         cascade_config,
         frusta,
         transform,
@@ -696,6 +773,10 @@ pub fn extract_lights(
 
         // TODO: update in place instead of reinserting.
         let mut extracted_cascades = EntityHashMap::default();
+        // sl-client fork (cached-static-shadow-map, scope 2): the retained static
+        // cascade projections, remapped to render entities alongside the dynamic
+        // cascades below.
+        let mut extracted_static_cascades = EntityHashMap::default();
         let mut extracted_frusta = EntityHashMap::default();
 
         if !directional_light.shadow_maps_enabled {
@@ -722,6 +803,14 @@ pub fn extract_lights(
             for (e, v) in cascades.cascades.iter() {
                 if let Ok(entity) = mapper.get(*e) {
                     extracted_cascades.insert(**entity, v.clone());
+                } else {
+                    break;
+                }
+            }
+            // sl-client fork (cached-static-shadow-map, scope 2).
+            for (e, v) in static_cascades.cascades.iter() {
+                if let Ok(entity) = mapper.get(*e) {
+                    extracted_static_cascades.insert(**entity, v.clone());
                 } else {
                     break;
                 }
@@ -778,6 +867,56 @@ pub fn extract_lights(
                 }
             }
 
+            // sl-client fork (cached-static-shadow-map): mirror the loop above for
+            // the *static* casters, into the offset subview indices that the
+            // retained static shadow subviews render. Populated every frame so the
+            // static Shadow phase keeps its bins; the *pass* (in `prepare_lights`)
+            // is what `bake_static` gates.
+            {
+                for (main_auxiliary_entity, static_mesh_entities_list) in
+                    static_visible_entities.entities.iter()
+                {
+                    for cascade_index in 0..(cascade_config.bounds.len() as u32) {
+                        let retained_view_entity = RetainedViewEntity {
+                            main_entity: MainEntity::from(main_entity),
+                            auxiliary_entity: MainEntity::from(*main_auxiliary_entity),
+                            subview_index: cascade_index + DIRECTIONAL_STATIC_SUBVIEW_OFFSET,
+                        };
+                        all_cascades_seen.insert(retained_view_entity);
+
+                        existing_shadow_map_visible_entities
+                            .subviews
+                            .entry(retained_view_entity)
+                            .or_default();
+
+                        let extracted_entities =
+                            &mut existing_extracted_shadow_map_visible_entities
+                                .subviews
+                                .entry(retained_view_entity)
+                                .or_default()
+                                .classes
+                                .entry(TypeId::of::<Mesh3d>())
+                                .or_default()
+                                .entities;
+                        extracted_entities.clear();
+                        let Some(static_mesh_entities) =
+                            static_mesh_entities_list.get(cascade_index as usize)
+                        else {
+                            continue;
+                        };
+                        extracted_entities.extend(static_mesh_entities.entities.iter().map(
+                            |main_entity| {
+                                let render_entity = match mapper.get(*main_entity) {
+                                    Ok(render_entity) => **render_entity,
+                                    Err(_) => Entity::PLACEHOLDER,
+                                };
+                                (render_entity, MainEntity::from(*main_entity))
+                            },
+                        ));
+                    }
+                }
+            }
+
             // Clear out visible entity lists corresponding to cascades that no
             // longer exist.
             existing_extracted_shadow_map_visible_entities
@@ -811,6 +950,7 @@ pub fn extract_lights(
             shadow_normal_bias: directional_light.shadow_normal_bias * core::f32::consts::SQRT_2,
             cascade_shadow_config: cascade_config.clone(),
             cascades: extracted_cascades,
+            static_cascades: extracted_static_cascades,
             frusta: extracted_frusta,
             render_layers: maybe_layers.unwrap_or_default().clone(),
             occlusion_culling,
@@ -1038,16 +1178,25 @@ pub fn prepare_lights(
         Query<&mut DirectionalLightViewEntities>,
     ),
     sorted_cameras: Res<SortedCameras>,
-    (gpu_preprocessing_support, decals): (
+    (gpu_preprocessing_support, decals, cached): (
         Res<GpuPreprocessingSupport>,
         Option<Res<RenderClusteredDecals>>,
+        // sl-client fork (cached-static-shadow-map): stride/bake config.
+        Res<CachedStaticShadows>,
     ),
     (existing_shadow_views, mut light_key_cache, mut specialized_shadow_material_pipeline_cache): (
         Query<&ShadowView>,
         ResMut<LightKeyCache>,
         ResMut<SpecializedShadowMaterialPipelineCache>,
     ),
+    // sl-client fork (cached-static-shadow-map, scope 2): the retained static
+    // subviews baked this frame, recorded here for
+    // `check_views_lights_need_specialization` to force-requeue.
+    mut static_shadow_bakes: ResMut<StaticShadowBakes>,
 ) {
+    // sl-client fork (cached-static-shadow-map, scope 2): reset the per-frame set
+    // of baking static subviews; it is repopulated below as each is decided.
+    static_shadow_bakes.views.clear();
     let views_iter = views.iter();
     let views_count = views_iter.len();
     let Some(mut view_gpu_lights_writer) =
@@ -1057,6 +1206,12 @@ pub fn prepare_lights(
     else {
         return;
     };
+
+    // sl-client fork (cached-static-shadow-map): each directional cascade is
+    // backed by two array layers (dynamic even, retained static odd), so the
+    // directional depth texture is `stride` times as deep and the shader steps
+    // layers by `stride`.
+    let cascade_layer_stride = CASCADE_LAYER_STRIDE;
 
     // Pre-calculate for PointLights
     let cube_face_rotations = CUBE_MAP_FACES
@@ -1418,7 +1573,11 @@ pub fn prepare_lights(
                     .min(render_device.limits().max_texture_dimension_2d),
                 height: (directional_light_shadow_map.size as u32)
                     .min(render_device.limits().max_texture_dimension_2d),
-                depth_or_array_layers: (num_directional_cascades_enabled
+                // sl-client fork (cached-static-shadow-map): `stride` layers per
+                // cascade (dynamic + retained static); spot maps still pack after
+                // all cascade layers.
+                depth_or_array_layers: (cascade_layer_stride as usize
+                    * num_directional_cascades_enabled
                     + spot_light_shadow_maps_count)
                     .max(1) as u32,
             },
@@ -1562,7 +1721,12 @@ pub fn prepare_lights(
             create_spot_shadow_map(
                 &mut commands,
                 &mut directional_light_depth_attachments,
-                (num_directional_cascades_enabled, light_index),
+                // sl-client fork (cached-static-shadow-map): spots pack after
+                // `stride` layers per cascade.
+                (
+                    cascade_layer_stride as usize * num_directional_cascades_enabled,
+                    light_index,
+                ),
                 &directional_light_depth_texture,
                 view_light_entity,
                 (light_entity, light_main_entity, light),
@@ -1576,7 +1740,12 @@ pub fn prepare_lights(
             create_spot_shadow_map(
                 &mut commands,
                 &mut directional_light_depth_attachments,
-                (num_directional_cascades_enabled, light_index),
+                // sl-client fork (cached-static-shadow-map): spots pack after
+                // `stride` layers per cascade.
+                (
+                    cascade_layer_stride as usize * num_directional_cascades_enabled,
+                    light_index,
+                ),
                 &directional_light_depth_texture,
                 // There should only be one view light entity for spotlights
                 point_and_spot_light_view_entities.0[0],
@@ -1705,7 +1874,10 @@ pub fn prepare_lights(
                 shadow_normal_bias: light.shadow_normal_bias,
                 num_cascades: num_cascades as u32,
                 cascades_overlap_proportion: light.cascade_shadow_config.overlap_proportion,
-                depth_texture_base_index: num_directional_cascades_enabled_for_this_view as u32,
+                // sl-client fork (cached-static-shadow-map): physical layer base
+                // is `stride` per logical cascade.
+                depth_texture_base_index: cascade_layer_stride
+                    * num_directional_cascades_enabled_for_this_view as u32,
                 sun_disk_angular_size: light.sun_disk_angular_size,
                 sun_disk_intensity: light.sun_disk_intensity,
                 decal_index: decals
@@ -1713,6 +1885,8 @@ pub fn prepare_lights(
                     .and_then(|decals| decals.get(*light_entity))
                     .and_then(|index| index.try_into().ok())
                     .unwrap_or(u32::MAX),
+                // sl-client fork (cached-static-shadow-map).
+                cascade_layer_stride,
             };
             num_directional_cascades_enabled_for_this_view += num_cascades;
         }
@@ -1732,7 +1906,10 @@ pub fn prepare_lights(
             // spotlight shadow maps are stored in the directional light array, starting at num_directional_cascades_enabled.
             // the spot lights themselves start in the light array at point_light_count. so to go from light
             // index to shadow map index, we need to subtract point light count and add directional shadowmap count.
-            spot_light_shadowmap_offset: num_directional_cascades_enabled as i32
+            // sl-client fork (cached-static-shadow-map): spot maps start after
+            // `stride` layers per cascade, not one.
+            spot_light_shadowmap_offset: cascade_layer_stride as i32
+                * num_directional_cascades_enabled as i32
                 - point_light_count as i32,
             ambient_light_affects_lightmapped_meshes: ambient_light.affects_lightmapped_meshes
                 as u32,
@@ -1809,47 +1986,57 @@ pub fn prepare_lights(
                 .zip(frusta)
                 .zip(&light.cascade_shadow_config.bounds);
 
+            // sl-client fork (cached-static-shadow-map, scope 2): this view's
+            // retained static cascades, indexed by cascade. Missing (e.g. before
+            // the first `build_directional_light_cascades`) falls back to the
+            // dynamic projection, which makes the static layer coincide with the
+            // dynamic one for that frame (still correct, just uncached).
+            let static_cascades_for_view = light.static_cascades.get(&entity);
+
+            // sl-client fork (cached-static-shadow-map): when caching is on, each
+            // cascade owns two view-light entities (dynamic + static) and two
+            // depth layers; stock Bevy owns one of each.
+            let entities_per_cascade = cascade_layer_stride as usize;
+            let wanted_view_entities = iter.len() * entities_per_cascade;
             let light_view_entities = light_view_entities.entry(entity).or_insert_with(|| {
-                (0..iter.len())
+                (0..wanted_view_entities)
                     .map(|_| commands.spawn_empty().id())
                     .collect()
             });
-            if light_view_entities.len() != iter.len() {
+            if light_view_entities.len() != wanted_view_entities {
                 let entities = mem::take(light_view_entities);
                 despawn_entities(&mut commands, entities);
-                light_view_entities.extend((0..iter.len()).map(|_| commands.spawn_empty().id()));
+                light_view_entities
+                    .extend((0..wanted_view_entities).map(|_| commands.spawn_empty().id()));
             }
 
-            for (cascade_index, (((cascade, frustum), bound), view_light_entity)) in
-                iter.zip(light_view_entities.iter().copied()).enumerate()
-            {
+            for (cascade_index, ((cascade, frustum), bound)) in iter.enumerate() {
+                // sl-client fork (cached-static-shadow-map, scope 2): the retained
+                // static projection for this cascade (or the dynamic one as a
+                // fallback when no static cascade is available yet).
+                let static_cascade =
+                    static_cascades_for_view.and_then(|list| list.get(cascade_index));
+                let static_clip_from_world =
+                    static_cascade.map_or(cascade.clip_from_world, |s| s.clip_from_world);
+                let static_texel_size = static_cascade.map_or(cascade.texel_size, |s| s.texel_size);
+                // Re-bake the static layer when its projection was just rebuilt
+                // (`dirty`) or when the viewer's static caster set changed
+                // (`cached.bake_static`). A missing static cascade forces a bake.
+                let bake_static = cached.bake_static || static_cascade.is_none_or(|s| s.dirty);
+
                 gpu_lights.directional_lights[light_index].cascades[cascade_index] =
                     GpuDirectionalCascade {
                         clip_from_world: cascade.clip_from_world,
+                        static_clip_from_world,
                         texel_size: cascade.texel_size,
+                        static_texel_size,
                         far_bound: *bound,
                     };
 
-                let depth_texture_view =
-                    directional_light_depth_texture
-                        .texture
-                        .create_view(&TextureViewDescriptor {
-                            label: Some("directional_light_shadow_map_array_texture_view"),
-                            format: None,
-                            dimension: Some(TextureViewDimension::D2),
-                            usage: None,
-                            aspect: TextureAspect::All,
-                            base_mip_level: 0,
-                            mip_level_count: None,
-                            base_array_layer: directional_depth_texture_array_index,
-                            array_layer_count: Some(1u32),
-                        });
-
-                // NOTE: For point and spotlights, we reuse the same depth attachment for all views.
-                // However, for directional lights, we want a new depth attachment for each view,
-                // so that the view is cleared for each view.
-                let depth_attachment = DepthAttachment::new(depth_texture_view.clone(), Some(0.0));
-
+                // Ordinal of this cascade among the view's enabled cascades; the
+                // physical dynamic layer is `stride * ordinal`, the retained
+                // static layer one beyond it.
+                let ordinal = directional_depth_texture_array_index;
                 directional_depth_texture_array_index += 1;
 
                 let mut frustum = *frustum;
@@ -1860,34 +2047,67 @@ pub fn prepare_lights(
                         .extend(f32::INFINITY),
                 );
 
-                let retained_view_entity = RetainedViewEntity::new(
+                // A single array layer's depth view, for a subview's attachment.
+                let layer_view = |base_array_layer: u32| {
+                    directional_light_depth_texture
+                        .texture
+                        .create_view(&TextureViewDescriptor {
+                            label: Some("directional_light_shadow_map_array_texture_view"),
+                            format: None,
+                            dimension: Some(TextureViewDimension::D2),
+                            usage: None,
+                            aspect: TextureAspect::All,
+                            base_mip_level: 0,
+                            mip_level_count: None,
+                            base_array_layer,
+                            array_layer_count: Some(1u32),
+                        })
+                };
+                // The cascade projection is identical for the dynamic and static
+                // subviews — only the retained-view subview index differs.
+                let extracted_view = |subview_index: u32| ExtractedView {
+                    retained_view_entity: RetainedViewEntity::new(
+                        *light_main_entity,
+                        Some(camera_main_entity.into()),
+                        subview_index,
+                    ),
+                    viewport: UVec4::new(
+                        0,
+                        0,
+                        directional_light_shadow_map.size as u32,
+                        directional_light_shadow_map.size as u32,
+                    ),
+                    world_from_view: GlobalTransform::from(cascade.world_from_cascade),
+                    clip_from_view: cascade.clip_from_cascade,
+                    clip_from_world: Some(cascade.clip_from_world),
+                    target_format: CORE_3D_DEPTH_FORMAT,
+                    color_grading: Default::default(),
+                    invert_culling: false,
+                };
+
+                // --- Dynamic subview: rendered every frame into the even layer. ---
+                let dynamic_entity = light_view_entities[cascade_index * entities_per_cascade];
+                let dynamic_depth_view = layer_view(cascade_layer_stride * ordinal);
+                let dynamic_retained_view_entity = RetainedViewEntity::new(
                     *light_main_entity,
                     Some(camera_main_entity.into()),
                     cascade_index as u32,
                 );
-
-                commands.entity(view_light_entity).insert((
+                commands.entity(dynamic_entity).insert((
                     ShadowView {
-                        depth_attachment,
+                        // NOTE: For point and spotlights, we reuse the same depth
+                        // attachment for all views. However, for directional
+                        // lights, we want a new depth attachment for each view, so
+                        // that the view is cleared for each view.
+                        depth_attachment: DepthAttachment::new(
+                            dynamic_depth_view.clone(),
+                            Some(0.0),
+                        ),
                         pass_name: format!(
                             "shadow_directional_light_{light_index}_cascade_{cascade_index}"
                         ),
                     },
-                    ExtractedView {
-                        retained_view_entity,
-                        viewport: UVec4::new(
-                            0,
-                            0,
-                            directional_light_shadow_map.size as u32,
-                            directional_light_shadow_map.size as u32,
-                        ),
-                        world_from_view: GlobalTransform::from(cascade.world_from_cascade),
-                        clip_from_view: cascade.clip_from_cascade,
-                        clip_from_world: Some(cascade.clip_from_world),
-                        target_format: CORE_3D_DEPTH_FORMAT,
-                        color_grading: Default::default(),
-                        invert_culling: false,
-                    },
+                    extracted_view(cascade_index as u32),
                     frustum,
                     LightEntity::Directional {
                         light_entity: *light_entity,
@@ -1896,29 +2116,116 @@ pub fn prepare_lights(
                 ));
 
                 if !matches!(gpu_preprocessing_mode, GpuPreprocessingMode::Culling) {
-                    commands.entity(view_light_entity).insert(NoIndirectDrawing);
+                    commands.entity(dynamic_entity).insert(NoIndirectDrawing);
                 }
 
-                view_lights.push(view_light_entity);
+                view_lights.push(dynamic_entity);
 
                 // If this light is using occlusion culling, add the appropriate components.
                 if light.occlusion_culling {
-                    commands.entity(view_light_entity).insert((
+                    commands.entity(dynamic_entity).insert((
                         OcclusionCulling,
                         OcclusionCullingSubview {
-                            depth_texture_view,
+                            depth_texture_view: dynamic_depth_view,
                             depth_texture_size: directional_light_shadow_map.size as u32,
                         },
                     ));
-                    view_occlusion_culling_lights.push(view_light_entity);
+                    view_occlusion_culling_lights.push(dynamic_entity);
                 }
 
                 // Subsequent views with the same light entity will **NOT** reuse the same shadow map
                 // (Because the cascades are unique to each view)
                 // TODO: Implement GPU culling for shadow passes.
                 shadow_render_phases
-                    .prepare_for_new_frame(retained_view_entity, gpu_preprocessing_mode);
-                live_shadow_mapping_lights.insert(retained_view_entity);
+                    .prepare_for_new_frame(dynamic_retained_view_entity, gpu_preprocessing_mode);
+                live_shadow_mapping_lights.insert(dynamic_retained_view_entity);
+
+                // --- Static subview: baked into the odd layer only when the
+                // viewer enables the feature, so its binned Shadow phase and
+                // its extracted visible set stay alive and retain their bins
+                // across frames — a binned phase only re-queues *new/dirty*
+                // entities, and settled static casters are never dirty, so an
+                // evicted-then-recreated phase would come back permanently empty.
+                // Only the actual **pass** is gated on `bake_static` (via the
+                // `view_lights` push below): on clean frames the static depth
+                // layer is simply not re-rendered, so its last bake is retained;
+                // on bake frames the pass re-encodes the retained bins. ---
+                {
+                    let static_entity =
+                        light_view_entities[cascade_index * entities_per_cascade + 1];
+                    let static_subview_index =
+                        cascade_index as u32 + DIRECTIONAL_STATIC_SUBVIEW_OFFSET;
+                    let static_retained_view_entity = RetainedViewEntity::new(
+                        *light_main_entity,
+                        Some(camera_main_entity.into()),
+                        static_subview_index,
+                    );
+                    // The static subview renders and is sampled with the retained
+                    // *static* projection (margin-expanded, texel-snapped), not
+                    // the per-frame dynamic cascade — this is what keeps the cached
+                    // depths aligned with the sample as the camera moves.
+                    let static_extracted_view = ExtractedView {
+                        retained_view_entity: static_retained_view_entity,
+                        viewport: UVec4::new(
+                            0,
+                            0,
+                            directional_light_shadow_map.size as u32,
+                            directional_light_shadow_map.size as u32,
+                        ),
+                        world_from_view: GlobalTransform::from(
+                            static_cascade
+                                .map_or(cascade.world_from_cascade, |s| s.world_from_cascade),
+                        ),
+                        clip_from_view: static_cascade
+                            .map_or(cascade.clip_from_cascade, |s| s.clip_from_cascade),
+                        clip_from_world: Some(static_clip_from_world),
+                        target_format: CORE_3D_DEPTH_FORMAT,
+                        color_grading: Default::default(),
+                        invert_culling: false,
+                    };
+                    commands.entity(static_entity).insert((
+                        ShadowView {
+                            depth_attachment: DepthAttachment::new(
+                                layer_view(cascade_layer_stride * ordinal + 1),
+                                Some(0.0),
+                            ),
+                            pass_name: format!(
+                                "shadow_directional_light_{light_index}_cascade_{cascade_index}_static"
+                            ),
+                        },
+                        static_extracted_view,
+                        frustum,
+                        LightEntity::Directional {
+                            light_entity: *light_entity,
+                            cascade_index,
+                        },
+                    ));
+                    // Match the dynamic subview's drawing path exactly: the
+                    // dynamic subview renders retained casters correctly via the
+                    // GPU indirect path, so the static subview must use the same
+                    // path (forcing `NoIndirectDrawing` here put the static casters
+                    // on the CPU direct path, which did not render retained —
+                    // only freshly re-queued — casters, so a settled static caster
+                    // cast no shadow).
+                    if !matches!(gpu_preprocessing_mode, GpuPreprocessingMode::Culling) {
+                        commands.entity(static_entity).insert(NoIndirectDrawing);
+                    }
+                    // Keep the phase alive every frame (retain its bins); only
+                    // render the pass on bake frames (projection rebuilt, or the
+                    // viewer's static caster set changed).
+                    if bake_static {
+                        view_lights.push(static_entity);
+                        // Record it so specialization forces a full re-queue this
+                        // frame (a retained binned phase otherwise re-queues only
+                        // new/changed casters, baking a partial set).
+                        static_shadow_bakes
+                            .views
+                            .insert(static_retained_view_entity);
+                    }
+                    shadow_render_phases
+                        .prepare_for_new_frame(static_retained_view_entity, gpu_preprocessing_mode);
+                    live_shadow_mapping_lights.insert(static_retained_view_entity);
+                }
             }
         }
 
@@ -2214,10 +2521,31 @@ pub fn check_views_lights_need_specialization(
     shadow_render_phases: Res<ViewBinnedRenderPhases<Shadow>>,
     mut light_key_cache: ResMut<LightKeyCache>,
     mut dirty_specializations: ResMut<DirtySpecializations>,
+    // sl-client fork (cached-static-shadow-map, scope 2): the static subviews
+    // baked this frame (decided per cascade in `prepare_lights`).
+    static_shadow_bakes: Res<StaticShadowBakes>,
 ) {
     for (light_entity, extracted_view_light) in &view_light_entities {
         if !shadow_render_phases.contains_key(&extracted_view_light.retained_view_entity) {
             continue;
+        }
+
+        // sl-client fork (cached-static-shadow-map): a retained *static* subview
+        // only re-queues incrementally (Bevy's binned phase adds new/changed
+        // entities and keeps the rest), which loses casters while the camera
+        // moves and the cascade membership churns — so a bake would render a
+        // partial set and its shadows would flicker. Force a full re-queue (wipe
+        // + re-add every visible caster) on the frames it is actually baked, so a
+        // bake always contains the complete static set. Only the subviews baked
+        // this frame are wiped, so the parked case keeps its cheap incremental
+        // path.
+        if static_shadow_bakes
+            .views
+            .contains(&extracted_view_light.retained_view_entity)
+        {
+            dirty_specializations
+                .views
+                .insert(extracted_view_light.retained_view_entity);
         }
 
         let is_directional_light = matches!(light_entity, LightEntity::Directional { .. });

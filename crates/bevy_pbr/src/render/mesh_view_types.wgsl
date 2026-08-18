@@ -26,7 +26,11 @@ const POINT_LIGHT_FLAGS_SPOT_LIGHT_BIT: u32                         = 1u << 5u;
 
 struct DirectionalCascade {
     clip_from_world: mat4x4<f32>,
+    // sl-client fork (cached-static-shadow-map, scope 2): projection for the
+    // retained static depth layer (see `GpuDirectionalCascade`).
+    static_clip_from_world: mat4x4<f32>,
     texel_size: f32,
+    static_texel_size: f32,
     far_bound: f32,
 }
 
@@ -45,6 +49,9 @@ struct DirectionalLight {
     decal_index: u32,
     sun_disk_angular_size: f32,
     sun_disk_intensity: f32,
+    // sl-client fork (cached-static-shadow-map): per-cascade depth-layer stride
+    // (1 = stock; 2 = dynamic + retained static layer). See `shadows.wgsl`.
+    cascade_layer_stride: u32,
 };
 
 const DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT: u32                  = 1u << 0u;

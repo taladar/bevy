@@ -465,6 +465,23 @@ pub struct CascadesVisibleEntities {
     pub entities: EntityHashMap<Vec<VisibleMeshEntities>>,
 }
 
+/// sl-client fork (cached-static-shadow-map): the *static* subset of a
+/// directional light's shadow casters, in the same per-cascade shape as
+/// [`CascadesVisibleEntities`] (which the fork repurposes to hold the *dynamic*
+/// subset). Populated by the viewer's off-thread shadow-caster cull and consumed
+/// by `bevy_pbr`'s forked `extract_lights`/`prepare_lights` to bake the static
+/// casters into a retained shadow-map layer that is re-rendered only on
+/// invalidation. Empty (and unused) unless the viewer enables the cached-static
+/// shadow feature, so stock behaviour is unchanged.
+#[derive(Component, Clone, Debug, Default, Reflect)]
+#[reflect(Component, Default, Clone)]
+pub struct CascadesStaticVisibleEntities {
+    /// Map of view entity to the visible *static* entities for each cascade
+    /// frustum.
+    #[reflect(ignore, clone)]
+    pub entities: EntityHashMap<Vec<VisibleMeshEntities>>,
+}
+
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
 pub enum VisibilitySystems {
     /// Label for the [`calculate_bounds`], `calculate_bounds_2d` and `calculate_bounds_text2d` systems,
