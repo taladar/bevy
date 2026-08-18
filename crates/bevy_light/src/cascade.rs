@@ -411,28 +411,56 @@ pub fn build_directional_light_cascades(
             // static projection for each cascade, reusing this view's prior state
             // for the coverage-fit test.
             let previous_view_static = previous_static.get(&view_entity);
-            let mut view_static_cascades = Vec::with_capacity(cascades_config.bounds.len());
-            let view_cascades = near_bounds
-                .zip(far_bounds)
-                .enumerate()
-                .map(|(cascade_index, (near_bound, far_bound))| {
-                    // Negate bounds as -z is camera forward direction.
-                    let corners = projection.get_frustum_corners(-near_bound, -far_bound);
-                    view_static_cascades.push(calculate_static_cascade(
-                        corners,
-                        directional_light_shadow_map.size as f32,
-                        world_from_light,
-                        light_view_from_camera,
-                        previous_view_static.and_then(|prev| prev.get(cascade_index)),
-                    ));
-                    calculate_cascade(
-                        corners,
-                        directional_light_shadow_map.size as f32,
-                        world_from_light,
-                        light_view_from_camera,
-                    )
-                })
-                .collect();
+            let bounds: Vec<(f32, f32)> =
+                near_bounds.zip(far_bounds).map(|(near, far)| (near, *far)).collect();
+            let mut view_cascades = Vec::with_capacity(bounds.len());
+            let mut view_static_cascades = Vec::with_capacity(bounds.len());
+            let mut cascade_corners = Vec::with_capacity(bounds.len());
+            for (cascade_index, (near_bound, far_bound)) in bounds.iter().copied().enumerate() {
+                // Negate bounds as -z is camera forward direction.
+                let corners = projection.get_frustum_corners(-near_bound, -far_bound);
+                cascade_corners.push(corners);
+                view_static_cascades.push(calculate_static_cascade(
+                    corners,
+                    directional_light_shadow_map.size as f32,
+                    world_from_light,
+                    light_view_from_camera,
+                    previous_view_static.and_then(|prev| prev.get(cascade_index)),
+                ));
+                view_cascades.push(calculate_cascade(
+                    corners,
+                    directional_light_shadow_map.size as f32,
+                    world_from_light,
+                    light_view_from_camera,
+                ));
+            }
+
+            // sl-client fork (cached-static-shadow-map): synchronize static
+            // re-bakes across a view's cascades. If ANY cascade's retained
+            // projection was rebuilt this frame, rebuild the rest too (forcing
+            // `previous = None`), so all cascades share one projection age and
+            // re-bake on the same frame (the bake gate in `prepare_lights` bakes
+            // every `dirty` cascade). Independent per-cascade rebuilds otherwise
+            // leave adjacent static cascades culled against different-age frusta,
+            // which shows as shadow seams that flicker as the camera moves and as
+            // casters that vanish on one side of a cascade boundary. The cost — a
+            // cascade that still fit is rebuilt early — is accepted: consistency
+            // across the static cascades matters more than squeezing the last
+            // frames out of each margin.
+            if view_static_cascades.iter().any(|cascade| cascade.dirty) {
+                for (cascade_index, cascade) in view_static_cascades.iter_mut().enumerate() {
+                    if !cascade.dirty {
+                        *cascade = calculate_static_cascade(
+                            cascade_corners[cascade_index],
+                            directional_light_shadow_map.size as f32,
+                            world_from_light,
+                            light_view_from_camera,
+                            None,
+                        );
+                    }
+                }
+            }
+
             cascades.cascades.insert(view_entity, view_cascades);
             static_cascades
                 .cascades

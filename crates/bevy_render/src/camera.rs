@@ -965,6 +965,43 @@ impl DirtySpecializations {
             })
     }
 
+    /// sl-client fork (cached-static-shadow-map): the dequeue set for a RETAINED
+    /// phase — the static shadow subview.
+    ///
+    /// Unlike [`Self::iter_to_dequeue`], a caster that merely *changed* (e.g. its
+    /// material was re-specialized because a texture-LOD swap replaced its base
+    /// texture) is **not** removed. Its retained, mesh-keyed shadow bin entry stays
+    /// valid across such a change, and [`iter_to_queue`](Self::iter_to_queue)
+    /// reconciles it in place via the upserting `add` (a no-op when the shadow
+    /// pipeline is unchanged, a relocation when a transparency change alters it).
+    /// Removing it here instead would drop it from the bake during the
+    /// re-specialization gap — the "rotating disappearing static shadows" bug.
+    ///
+    /// Only entities that genuinely left the view or were despawned are removed.
+    /// A re-queue-only view still wipes everything, matching
+    /// [`Self::iter_to_dequeue`].
+    pub fn iter_to_dequeue_retained<'a>(
+        &'a self,
+        view: RetainedViewEntity,
+        render_visible_mesh_entities: &'a RenderVisibleEntitiesClass,
+    ) -> impl Iterator<Item = &'a MainEntity> {
+        render_visible_mesh_entities
+            .removed_entities
+            .iter()
+            .map(|(_, main_entity)| main_entity)
+            .chain(if self.must_wipe_specializations_for_view(view) {
+                Either::Left(
+                    render_visible_mesh_entities
+                        .iter_visible()
+                        .map(|(_, main_entity)| main_entity),
+                )
+            } else {
+                // Genuinely-despawned renderables only; a still-visible *changed*
+                // caster keeps its retained bin entry.
+                Either::Right(self.removed_renderables.iter())
+            })
+    }
+
     /// Iterates over all renderables that potentially need to be re-queued.
     ///
     /// This includes both renderables that became visible and those that are in

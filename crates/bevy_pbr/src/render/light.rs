@@ -2521,31 +2521,10 @@ pub fn check_views_lights_need_specialization(
     shadow_render_phases: Res<ViewBinnedRenderPhases<Shadow>>,
     mut light_key_cache: ResMut<LightKeyCache>,
     mut dirty_specializations: ResMut<DirtySpecializations>,
-    // sl-client fork (cached-static-shadow-map, scope 2): the static subviews
-    // baked this frame (decided per cascade in `prepare_lights`).
-    static_shadow_bakes: Res<StaticShadowBakes>,
 ) {
     for (light_entity, extracted_view_light) in &view_light_entities {
         if !shadow_render_phases.contains_key(&extracted_view_light.retained_view_entity) {
             continue;
-        }
-
-        // sl-client fork (cached-static-shadow-map): a retained *static* subview
-        // only re-queues incrementally (Bevy's binned phase adds new/changed
-        // entities and keeps the rest), which loses casters while the camera
-        // moves and the cascade membership churns — so a bake would render a
-        // partial set and its shadows would flicker. Force a full re-queue (wipe
-        // + re-add every visible caster) on the frames it is actually baked, so a
-        // bake always contains the complete static set. Only the subviews baked
-        // this frame are wiped, so the parked case keeps its cheap incremental
-        // path.
-        if static_shadow_bakes
-            .views
-            .contains(&extracted_view_light.retained_view_entity)
-        {
-            dirty_specializations
-                .views
-                .insert(extracted_view_light.retained_view_entity);
         }
 
         let is_directional_light = matches!(light_entity, LightEntity::Directional { .. });
@@ -2613,6 +2592,12 @@ pub(crate) fn specialize_shadows(
     state: &mut SystemState<SpecializeShadowsSystemParam>,
     mut work_items: Local<Vec<ShadowSpecializationWorkItem>>,
     mut all_shadow_views: Local<HashSet<RetainedViewEntity, FixedHasher>>,
+    // sl-client fork (cached-static-shadow-map): last-known-good shadow material
+    // properties per caster, so a caster can still be specialized while its
+    // `PreparedMaterial` is transiently absent during a re-prep (an SL texture-LOD
+    // swap). The shadow specialization needs only these properties, and they are
+    // stable across a texture swap. See the `render_materials.get` fallback below.
+    mut shadow_props_cache: Local<MainEntityHashMap<Arc<MaterialProperties>>>,
 ) {
     work_items.clear();
     all_shadow_views.clear();
@@ -2716,14 +2701,36 @@ pub(crate) fn specialize_shadows(
                         .insert((*render_entity, *visible_entity));
                     continue;
                 };
-                let Some(material) = render_materials.get(material_instance.asset_id) else {
-                    view_pending_shadow_queues
-                        .current_frame
-                        .insert((*render_entity, *visible_entity));
-                    continue;
+                // sl-client fork (cached-static-shadow-map): the `PreparedMaterial`
+                // is transiently ABSENT while it is being re-prepared — an SL
+                // texture-LOD swap fires `AssetChanged` on the material, which
+                // re-preps it and briefly drops it from `render_materials`. Bailing
+                // to pending here spec-misses the caster, and the retained static
+                // bake then drops its shadow for the whole gap (the rotating
+                // disappearing-static-shadows bug). But the shadow specialization
+                // needs only `properties` (shadows_enabled, alpha_mode, draw
+                // functions, material_key), all STABLE across a texture swap — so
+                // reuse the caster's last-known-good properties across the gap
+                // instead of dropping it. Only a caster whose material has never
+                // resolved (genuinely still loading) has no cache entry and falls
+                // through to pending, where a brief no-shadow is expected.
+                let material_props = match render_materials.get(material_instance.asset_id) {
+                    Some(material) => {
+                        shadow_props_cache.insert(*visible_entity, material.properties.clone());
+                        material.properties.clone()
+                    }
+                    None => match shadow_props_cache.get(visible_entity) {
+                        Some(cached) => cached.clone(),
+                        None => {
+                            view_pending_shadow_queues
+                                .current_frame
+                                .insert((*render_entity, *visible_entity));
+                            continue;
+                        }
+                    },
                 };
 
-                if !material.properties.shadows_enabled {
+                if !material_props.shadows_enabled {
                     // If the material is not a shadow caster, we don't need to specialize it.
                     continue;
                 }
@@ -2752,7 +2759,7 @@ pub(crate) fn specialize_shadows(
                     mesh_key |= MeshPipelineKey::LIGHTMAPPED;
                 }
 
-                mesh_key |= match material.properties.alpha_mode {
+                mesh_key |= match material_props.alpha_mode {
                     AlphaMode::Mask(_)
                     | AlphaMode::Blend
                     | AlphaMode::Premultiplied
@@ -2766,13 +2773,19 @@ pub(crate) fn specialize_shadows(
                     retained_view_entity: extracted_view_light.retained_view_entity,
                     mesh_key,
                     layout: mesh.layout.clone(),
-                    properties: material.properties.clone(),
+                    properties: material_props.clone(),
                     material_type_id: material_instance.asset_id.type_id(),
                 });
             }
         }
 
         pending_shadow_queues.expire_stale_views(&all_shadow_views);
+
+        // sl-client fork (cached-static-shadow-map): drop cached shadow properties
+        // for despawned casters so the last-known-good cache stays bounded.
+        for entity in dirty_specializations.removed_renderables.iter() {
+            shadow_props_cache.remove(entity);
+        }
     }
 
     let depth_clip_control_supported = world
@@ -2871,22 +2884,84 @@ pub fn queue_shadows(
             continue;
         };
 
-        // First, remove meshes that need to be respecialized, and those that were removed, from the bins.
-        for &main_entity in dirty_specializations
-            .iter_to_dequeue(extracted_view_light.retained_view_entity, visible_entities)
-        {
-            shadow_phase.remove(main_entity);
+        // sl-client fork (cached-static-shadow-map) diagnostics: for a static
+        // subview, log what the queue *sees* this frame (visible-entity counts +
+        // this frame's delta) and what is already binned, so a drop can be
+        // localized to the cull/visible-list vs the binning. Gated; off normally.
+        let is_static_subview = extracted_view_light.retained_view_entity.subview_index
+            >= DIRECTIONAL_STATIC_SUBVIEW_OFFSET;
+        let log_static_bake = is_static_subview && std::env::var_os("SL_VIEWER_LOG_BAKE").is_some();
+        if log_static_bake {
+            eprintln!(
+                "queue static cam={:?} sub={} vis_cpu={} vis_gpu={} added={} removed={} bins_before={}",
+                extracted_view_light.retained_view_entity.auxiliary_entity,
+                extracted_view_light.retained_view_entity.subview_index,
+                visible_entities.entities_cpu_culling.len(),
+                visible_entities.entities_gpu_culling.len(),
+                visible_entities.added_entities.len(),
+                visible_entities.removed_entities.len(),
+                shadow_phase.binned_entity_count(),
+            );
         }
 
+        // First, remove meshes that need to be respecialized, and those that were removed, from the bins.
+        //
+        // sl-client fork (cached-static-shadow-map): the retained *static* subview
+        // uses `iter_to_dequeue_retained`, which does NOT remove a still-visible
+        // caster that merely changed (e.g. a texture-LOD swap re-specialized its
+        // material). Its mesh-keyed shadow bin entry stays valid and is reconciled
+        // in place by the upserting `add` below — a no-op when the shadow pipeline
+        // is unchanged, a relocation when a transparency change alters it. Removing
+        // it here would drop it from the retained bake during the re-specialization
+        // gap (the rotating-disappearing-static-shadows bug). The per-frame dynamic
+        // subview keeps the stock dequeue (it re-renders every frame regardless).
+        if is_static_subview {
+            for &main_entity in dirty_specializations
+                .iter_to_dequeue_retained(extracted_view_light.retained_view_entity, visible_entities)
+            {
+                shadow_phase.remove(main_entity);
+            }
+        } else {
+            for &main_entity in dirty_specializations
+                .iter_to_dequeue(extracted_view_light.retained_view_entity, visible_entities)
+            {
+                shadow_phase.remove(main_entity);
+            }
+        }
+
+        // sl-client fork (cached-static-shadow-map) diagnostics: count why an
+        // entity yielded for (re-)queue fails to be added back. The specialization
+        // cache miss is the prime suspect: unlike the mesh/material-not-loaded
+        // cases it does NOT add the entity to `pending`, so a still-visible caster
+        // dequeued (a `Changed`) and not re-specialized falls out of the retained
+        // bins with nothing to re-queue it.
+        let mut q_iter = 0u32;
+        let mut q_spec_miss = 0u32;
+        let mut q_added = 0u32;
         // Now iterate through all newly-visible entities and those needing respecialization.
         for (render_entity, main_entity) in dirty_specializations.iter_to_queue(
             extracted_view_light.retained_view_entity,
             visible_entities,
             &view_pending_shadow_queues.prev_frame,
         ) {
+            q_iter = q_iter.saturating_add(1);
             let Some(&(pipeline_id, draw_function)) =
                 view_specialized_material_pipeline_cache.get(main_entity)
             else {
+                q_spec_miss = q_spec_miss.saturating_add(1);
+                // sl-client fork (cached-static-shadow-map): a still-visible caster
+                // whose specialization isn't in the cache this frame (its material
+                // was just despecialized — e.g. a per-frame material re-prep) must
+                // be RETRIED, not dropped. Stock can drop it because it re-queues
+                // every frame; the retained static phase does not, so a dropped
+                // caster falls out of the retained bins and its shadow vanishes
+                // until something else re-queues it (the "rotating disappearing
+                // static shadows" bug). Route it through `pending` like the
+                // not-yet-loaded mesh/material branches below, so it is
+                // re-specialized and re-queued next frame and self-heals.
+                view_pending_shadow_queues
+                    .current_frame
+                    .insert((*render_entity, *main_entity));
                 continue;
             };
 
@@ -2958,6 +3033,34 @@ pub fn queue_shadows(
                     mesh_instance.should_batch(),
                     &gpu_preprocessing_support,
                 ),
+            );
+            q_added = q_added.saturating_add(1);
+        }
+
+        // sl-client fork (cached-static-shadow-map) diagnostics: the retained bin
+        // count *after* this frame's dequeue+requeue for a static subview. If it
+        // falls below `bins_before` while the scene is static, casters were
+        // dequeued (a mesh/material `Changed`) and not re-added (a `continue` in
+        // the queue loop above) — the drop the live viewer exhibits.
+        if log_static_bake {
+            // Which *visible* casters are NOT in the bins (would be missing from the
+            // bake), and their identities — so a rotating drop set is visible. Only
+            // list a few ids to keep the log bounded.
+            let mut missing_ids: Vec<u64> = Vec::new();
+            let mut missing_count = 0u32;
+            for (_render_entity, main_entity) in &visible_entities.entities_cpu_culling {
+                if !shadow_phase.is_binned(*main_entity) {
+                    missing_count = missing_count.saturating_add(1);
+                    if missing_ids.len() < 8 {
+                        missing_ids.push(main_entity.id().to_bits());
+                    }
+                }
+            }
+            eprintln!(
+                "queue static cam={:?} sub={} bins_after={} q_iter={q_iter} q_spec_miss={q_spec_miss} q_added={q_added} missing={missing_count} ids={missing_ids:?}",
+                extracted_view_light.retained_view_entity.auxiliary_entity,
+                extracted_view_light.retained_view_entity.subview_index,
+                shadow_phase.binned_entity_count(),
             );
         }
     }
@@ -3153,6 +3256,22 @@ fn view_shadow_pass<const IS_LATE: bool>(
     else {
         return;
     };
+
+    // sl-client fork (cached-static-shadow-map) diagnostics: how many casters a
+    // static bake actually draws this frame. Compared against the queue log's
+    // bin count, this pins the drop to the queue/bins (if this is short) rather
+    // than the render. Gated; off in normal runs.
+    if !IS_LATE
+        && view_light.pass_name.ends_with("_static")
+        && std::env::var_os("SL_VIEWER_LOG_BAKE").is_some()
+    {
+        eprintln!(
+            "bake cam={:?} {} draws={}",
+            extracted_light_view.retained_view_entity.auxiliary_entity,
+            view_light.pass_name,
+            shadow_phase.binned_entity_count(),
+        );
+    }
 
     #[cfg(feature = "trace")]
     let _shadow_pass_span = info_span!("", "{}", view_light.pass_name).entered();
