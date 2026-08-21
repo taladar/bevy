@@ -342,26 +342,150 @@ pub fn ui_focus_system(
 
 /// Walk up the tree child-to-parent checking that `point` is not clipped by any ancestor node.
 /// If `entity` has an [`OverrideClip`] component it ignores any inherited clipping and returns true.
+///
+/// sl-client fork: the walk continues past an ancestor that does **not** clip.
+/// Upstream folds "this ancestor clips" into the same `let`-chain that finds the
+/// parent, so the first ancestor with visible overflow ends the walk and answers
+/// "unclipped" — no clipping *grand*parent is ever consulted. A node is then
+/// only ever clip-tested when every ancestor up to the clipper also clips, i.e.
+/// in practice when it is a direct child of it. Anything nested deeper inside a
+/// scroll container (a wrapping row of text spans inside a content column, say)
+/// keeps live hit boxes wherever its layout puts it — including well outside the
+/// scroll view, over unrelated UI.
 pub fn clip_check_recursive(
     point: Vec2,
     entity: Entity,
     clipping_query: &Query<'_, '_, (&ComputedNode, &UiGlobalTransform, &Node)>,
     child_of_query: &Query<&ChildOf, Without<OverrideClip>>,
 ) -> bool {
-    if let Ok(child_of) = child_of_query.get(entity)
-        && let Ok((computed_node, transform, node)) = clipping_query.get(child_of.0)
-        && !node.overflow.is_visible()
-    {
-        if transform.try_inverse().is_none_or(|affine| {
+    // Reached the root — or an `OverrideClip`, which the query filters out, so
+    // it deliberately ends the walk: unclipped by all ancestors.
+    let Ok(child_of) = child_of_query.get(entity) else {
+        return true;
+    };
+    let Ok((computed_node, transform, node)) = clipping_query.get(child_of.0) else {
+        return true;
+    };
+    if !node.overflow.is_visible()
+        && transform.try_inverse().is_none_or(|affine| {
             !computed_node
                 .resolve_clip_rect(node.overflow, node.overflow_clip_margin)
                 .contains(affine.transform_point2(point))
-        }) {
-            // The point is clipped (or transform not invertible) → ignore for picking
-            return false;
-        }
-        return clip_check_recursive(point, child_of.0, clipping_query, child_of_query);
+        })
+    {
+        // The point is clipped (or transform not invertible) → ignore for picking
+        return false;
     }
-    // Reached root, point unclipped by all ancestors
-    true
+    // This ancestor does not exclude the point; a higher one still might.
+    clip_check_recursive(point, child_of.0, clipping_query, child_of_query)
+}
+
+// sl-client fork: regression coverage for the clip walk above.
+#[cfg(test)]
+mod tests {
+    use super::clip_check_recursive;
+    use crate::{ui_transform::UiGlobalTransform, ComputedNode, Node, Overflow, OverrideClip};
+    use bevy_ecs::{
+        hierarchy::ChildOf,
+        prelude::{Entity, World},
+        query::Without,
+        system::{Query, SystemState},
+    };
+    use bevy_math::Vec2;
+
+    /// Run the clip walk for `entity` at `point` against `world`.
+    fn unclipped(world: &mut World, entity: Entity, point: Vec2) -> bool {
+        let mut state: SystemState<(
+            Query<(&ComputedNode, &UiGlobalTransform, &Node)>,
+            Query<&ChildOf, Without<OverrideClip>>,
+        )> = SystemState::new(world);
+        let Ok((clipping_query, child_of_query)) = state.get(world) else {
+            panic!("the clip-walk queries are always satisfiable");
+        };
+        clip_check_recursive(point, entity, &clipping_query, &child_of_query)
+    }
+
+    /// A clipping ancestor is honoured **however deep** the node sits under it —
+    /// the walk must not stop at the first ancestor that happens not to clip.
+    ///
+    /// The chain here is the everyday one: a scroll container, a content column
+    /// inside it, and the pickable leaf inside that. Only the container clips.
+    #[test]
+    fn a_clipping_grandparent_still_clips() {
+        let mut world = World::new();
+        let clipper = world
+            .spawn((
+                Node {
+                    overflow: Overflow::clip(),
+                    ..Default::default()
+                },
+                ComputedNode {
+                    size: Vec2::splat(100.),
+                    ..Default::default()
+                },
+                UiGlobalTransform::default(),
+            ))
+            .id();
+        // Between the clipper and the leaf: a plain, non-clipping column.
+        let column = world
+            .spawn((
+                Node::default(),
+                ComputedNode::default(),
+                UiGlobalTransform::default(),
+                ChildOf(clipper),
+            ))
+            .id();
+        let leaf = world
+            .spawn((
+                Node::default(),
+                ComputedNode::default(),
+                UiGlobalTransform::default(),
+                ChildOf(column),
+            ))
+            .id();
+
+        let inside = Vec2::ZERO;
+        let outside = Vec2::new(0., 400.);
+
+        assert!(unclipped(&mut world, column, inside));
+        assert!(
+            !unclipped(&mut world, column, outside),
+            "a direct child is clipped by its parent"
+        );
+        assert!(unclipped(&mut world, leaf, inside));
+        assert!(
+            !unclipped(&mut world, leaf, outside),
+            "and so is a grandchild, through the column that does not clip"
+        );
+    }
+
+    /// `OverrideClip` still ends the walk, so a popover deliberately escaping an
+    /// enclosing clip keeps its hit box.
+    #[test]
+    fn override_clip_still_escapes() {
+        let mut world = World::new();
+        let clipper = world
+            .spawn((
+                Node {
+                    overflow: Overflow::clip(),
+                    ..Default::default()
+                },
+                ComputedNode {
+                    size: Vec2::splat(100.),
+                    ..Default::default()
+                },
+                UiGlobalTransform::default(),
+            ))
+            .id();
+        let escapee = world
+            .spawn((
+                Node::default(),
+                ComputedNode::default(),
+                UiGlobalTransform::default(),
+                OverrideClip,
+                ChildOf(clipper),
+            ))
+            .id();
+        assert!(unclipped(&mut world, escapee, Vec2::new(0., 400.)));
+    }
 }
