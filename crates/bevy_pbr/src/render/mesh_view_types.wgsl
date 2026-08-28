@@ -145,6 +145,23 @@ struct LightProbe {
     // This is stored as the transpose in order to save space in this structure.
     // It'll be transposed in the `environment_map_light` function.
     light_from_world_transposed: mat3x4<f32>,
+    // The inverse of `light_from_world_transposed`: the transform from light
+    // probe model space back to world space, stored transposed the same way.
+    //
+    // Parallax correction intersects the reflected ray in model space, where the
+    // probe is a 1×1×1 cube, so a non-uniformly scaled probe squashes the hit
+    // point. This takes that hit back to world space, which is the frame
+    // `sample_rotation` reads directions in.
+    world_from_light_transposed: mat3x4<f32>,
+    // The rotation, as a quaternion, that takes a world-space direction into the
+    // frame this probe's cubemap was authored in.
+    //
+    // This is deliberately *not* folded into the two matrices above: those also
+    // define the probe's influence volume, and a rotation multiplied into them
+    // shears the volume of any non-uniformly scaled probe while folding that
+    // scale into the sampling frame, bending reflected directions
+    // anisotropically.
+    sample_rotation: vec4<f32>,
     // The falloff region, specified as a fraction of the light probe's
     // bounding box.
     falloff: vec3<f32>,

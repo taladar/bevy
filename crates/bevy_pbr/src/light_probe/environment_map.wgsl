@@ -33,6 +33,10 @@ struct MultiscatterResult {
 // * `light_from_world` is the matrix that transforms world space into light
 //   probe space (a 1×1×1 cube centered on the origin).
 //
+// * `world_from_light` is its inverse, which takes a parallax-corrected hit
+//   point back out of that squashed space into world space. It's ignored if the
+//   `parallax_correct` parameter is false.
+//
 // * `parallax_correction_bounds` is the half-extents of the simulated
 //   reflection boundaries used for parallax correction, in light probe space.
 //   It's ignored if the `parallax_correct` parameter is false.
@@ -43,9 +47,10 @@ fn compute_cubemap_sample_dir(
     world_ray_origin: vec3<f32>,
     world_ray_direction: vec3<f32>,
     light_from_world: mat4x4<f32>,
+    world_from_light: mat4x4<f32>,
     parallax_correction_bounds: vec3<f32>,
     parallax_correct: bool,
-    view_rotation: vec4<f32>,
+    sample_rotation: vec4<f32>,
 ) -> vec3<f32> {
     var sample_dir: vec3<f32>;
 
@@ -78,16 +83,22 @@ fn compute_cubemap_sample_dir(
         let t = min(min(t_min.x, t_min.y), t_min.z);
 
         // Compute the sample direction. (It doesn't have to be normalized.)
-        sample_dir = ray_origin + ray_direction * t;
+        //
+        // The hit is in light probe space, where the probe is a unit cube, so a
+        // non-uniformly scaled probe has squashed it. Take it back to world
+        // space, which is the frame `sample_rotation` reads directions in.
+        sample_dir = (world_from_light * vec4(ray_origin + ray_direction * t, 0.0)).xyz;
     } else {
         // We treat the reflection as infinitely far away in the non-parallax
-        // case, so the ray origin is irrelevant.
-        sample_dir = (light_from_world * vec4(world_ray_direction, 0.0)).xyz;
+        // case, so the ray origin is irrelevant — and so is the probe's volume:
+        // only the frame its texture was authored in matters, which is what
+        // `sample_rotation` carries.
+        sample_dir = world_ray_direction;
     }
 
-    // Rotating the world space ray direction by the environment map light view rotation,
-    // it is equivalent to rotating the environment cubemap itself.
-    sample_dir = quat_rotate(view_rotation, sample_dir);
+    // Rotating the world space ray direction into the frame the cubemap was
+    // authored in is equivalent to rotating the environment cubemap itself.
+    sample_dir = quat_rotate(sample_rotation, sample_dir);
 
     // Cubemaps are left-handed, so we negate the Z coordinate.
     sample_dir.z = -sample_dir.z;
@@ -128,7 +139,7 @@ fn compute_radiances(
 
     while (true) {
         var query_result = light_probe_iterator_next(&iterator);
-        var view_rotation = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        var sample_rotation = query_result.sample_rotation;
 
         // If we reached the end of the light probe list, and we didn't find
         // enough reflection probes to reach a weight of 1.0, use the view
@@ -137,8 +148,14 @@ fn compute_radiances(
         if (query_result.texture_index < 0 && total_weight < 0.9999) {
             query_result.texture_index = light_probes.view_cubemap_index;
             query_result.intensity = light_probes.intensity_for_view;
-            view_rotation = light_probes.view_rotation;
+            sample_rotation = light_probes.view_rotation;
             query_result.light_from_world = mat4x4(
+                vec4(1.0, 0.0, 0.0, 0.0),
+                vec4(0.0, 1.0, 0.0, 0.0),
+                vec4(0.0, 0.0, 1.0, 0.0),
+                vec4(0.0, 0.0, 0.0, 1.0)
+            );
+            query_result.world_from_light = mat4x4(
                 vec4(1.0, 0.0, 0.0, 0.0),
                 vec4(0.0, 1.0, 0.0, 0.0),
                 vec4(0.0, 0.0, 1.0, 0.0),
@@ -177,9 +194,10 @@ fn compute_radiances(
                 world_position,
                 N,
                 query_result.light_from_world,
+                query_result.world_from_light,
                 query_result.parallax_correction_bounds,
                 parallax_correct,
-                view_rotation,
+                sample_rotation,
             );
             radiances.irradiance = textureSampleLevel(
                 bindings::diffuse_environment_maps[query_result.texture_index],
@@ -193,9 +211,10 @@ fn compute_radiances(
             world_position,
             radiance_sample_dir,
             query_result.light_from_world,
+            query_result.world_from_light,
             query_result.parallax_correction_bounds,
             parallax_correct,
-            view_rotation,
+            sample_rotation,
         );
         radiances.radiance +=
             textureSampleLevel(

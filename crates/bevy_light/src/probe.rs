@@ -124,7 +124,10 @@ pub struct EnvironmentMapLight {
     /// This is useful for users who require a different axis, such as the Z-axis, to serve
     /// as the vertical axis.
     ///
-    /// Note: This only has an effect if attached to a view.
+    /// On a [`LightProbe`] this rotates the cubemap **only**: it composes with
+    /// the probe's own world rotation to form the frame the cubemap is read in,
+    /// and leaves the probe's transform — and so its influence volume —
+    /// untouched.
     pub rotation: Quat,
 
     /// Whether the light from this environment map contributes diffuse lighting

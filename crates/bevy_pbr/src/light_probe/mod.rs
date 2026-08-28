@@ -69,6 +69,20 @@ struct RenderLightProbe {
     /// efficiently check for bounding box intersection.
     light_from_world_transposed: [Vec4; 3],
 
+    /// The inverse of [`Self::light_from_world_transposed`]: the transform from
+    /// the model space back to world space, stored transposed the same way.
+    ///
+    /// Parallax correction intersects in model space, where the probe is a
+    /// 1×1×1 cube, and needs this to return a world-space direction.
+    world_from_light_transposed: [Vec4; 3],
+
+    /// The rotation, as a quaternion, that takes a world-space direction into
+    /// the frame this probe's texture was authored in.
+    ///
+    /// See [`LightProbeComponent::get_sample_rotation`] for why this is kept out
+    /// of the matrices above.
+    sample_rotation: Vec4,
+
     /// The falloff region, specified as a fraction of the light probe's
     /// bounding box.
     ///
@@ -187,6 +201,15 @@ where
 
     // The transform from light probe space to world space.
     world_from_light: Affine3A,
+
+    // The same transform, stored as its transpose so that it packs into three
+    // `Vec4`s on the GPU, exactly like [`Self::light_from_world`].
+    world_from_light_transposed: [Vec4; 3],
+
+    // The rotation that takes a world-space direction into the frame this light
+    // probe's texture was authored in — see
+    // [`LightProbeComponent::get_sample_rotation`].
+    sample_rotation: Quat,
 
     /// The radius of the bounding sphere that encompasses this light probe.
     ///
@@ -355,6 +378,26 @@ pub trait LightProbeComponent: Send + Sync + Component + Sized {
     /// light probes may want to perform other transforms.
     fn get_world_from_light_matrix(&self, original_world_from_light: &Affine3A) -> Affine3A {
         *original_world_from_light
+    }
+
+    /// Given the world-space rotation of the light probe's `GlobalTransform`,
+    /// returns the rotation that takes a **world-space direction** into the
+    /// frame this light probe's texture was authored in.
+    ///
+    /// This is deliberately separate from [`Self::get_world_from_light_matrix`],
+    /// which defines the probe's influence *volume*. Multiplying a rotation into
+    /// that matrix instead composes it with the probe's scale, so a
+    /// non-uniformly scaled probe gets a **sheared** influence volume (`R·S·R⁻¹`
+    /// maps the unit cube to a parallelepiped that no longer tracks the probe's
+    /// own box) and folds that scale into its sampling frame, bending reflected
+    /// directions anisotropically. A rotation of the texture must only rotate
+    /// the texture.
+    ///
+    /// The default undoes the probe's world rotation, which is what makes a
+    /// texture authored in the probe's own model space read correctly however
+    /// the probe is turned.
+    fn get_sample_rotation(&self, world_rotation: Quat) -> Quat {
+        world_rotation.inverse()
     }
 
     /// Returns the appropriate parallax correction bounds, as half extents in
@@ -606,10 +649,18 @@ where
         let world_from_light =
             environment_map.get_world_from_light_matrix(&light_probe_transform.affine());
         let light_from_world_transposed = Mat4::from(world_from_light.inverse()).transpose();
+        let world_from_light_transposed = Mat4::from(world_from_light).transpose();
         let bounding_sphere_radius = (world_from_light.matrix3 * Vec3::ONE).length();
+        let sample_rotation = environment_map.get_sample_rotation(light_probe_transform.rotation());
         environment_map.id(image_assets).map(|id| LightProbeInfo {
             main_entity: main_entity.into(),
             world_from_light,
+            world_from_light_transposed: [
+                world_from_light_transposed.x_axis,
+                world_from_light_transposed.y_axis,
+                world_from_light_transposed.z_axis,
+            ],
+            sample_rotation,
             light_from_world: [
                 light_from_world_transposed.x_axis,
                 light_from_world_transposed.y_axis,
@@ -701,6 +752,8 @@ where
             // Write in the light probe data.
             self.render_light_probes.push(RenderLightProbe {
                 light_from_world_transposed: light_probe.light_from_world,
+                world_from_light_transposed: light_probe.world_from_light_transposed,
+                sample_rotation: light_probe.sample_rotation.into(),
                 falloff: light_probe.falloff,
                 parallax_correction_bounds: light_probe.parallax_correction_bounds,
                 world_position: light_probe.world_from_light.translation.into(),
@@ -722,6 +775,8 @@ where
             main_entity: self.main_entity,
             light_from_world: self.light_from_world,
             world_from_light: self.world_from_light,
+            world_from_light_transposed: self.world_from_light_transposed,
+            sample_rotation: self.sample_rotation,
             falloff: self.falloff,
             parallax_correction_bounds: self.parallax_correction_bounds,
             bounding_sphere_radius: self.bounding_sphere_radius,

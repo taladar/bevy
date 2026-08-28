@@ -51,7 +51,7 @@ use bevy_ecs::{
 };
 use bevy_image::Image;
 use bevy_light::{EnvironmentMapLight, ParallaxCorrection};
-use bevy_math::{Affine3A, Quat, Vec3};
+use bevy_math::{Quat, Vec3};
 use bevy_render::{
     extract_instances::ExtractInstance,
     render_asset::RenderAssets,
@@ -322,9 +322,14 @@ impl LightProbeComponent for EnvironmentMapLight {
         render_view_light_probes
     }
 
-    fn get_world_from_light_matrix(&self, original_transform: &Affine3A) -> Affine3A {
-        // Take the `rotation` field into account.
-        *original_transform * Affine3A::from_quat(self.rotation)
+    fn get_sample_rotation(&self, world_rotation: Quat) -> Quat {
+        // Undo the probe's world rotation, so the cubemap is read in the space
+        // it was authored in, and take the `rotation` field into account on top
+        // of that. Note that this leaves the probe's transform — and therefore
+        // its influence volume — alone: rotating the cubemap must not reshape
+        // the volume, which folding this into `get_world_from_light_matrix`
+        // did for every non-uniformly scaled probe.
+        (world_rotation * self.rotation).inverse()
     }
 
     fn parallax_correction_bounds(

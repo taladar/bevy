@@ -22,6 +22,12 @@ struct LightProbeQueryResult {
     // Transform from world space to the light probe model space. In light probe
     // model space, the light probe is a 1×1×1 cube centered on the origin.
     light_from_world: mat4x4<f32>,
+    // The inverse of `light_from_world`: the transform from light probe model
+    // space back to world space.
+    world_from_light: mat4x4<f32>,
+    // The rotation, as a quaternion, that takes a world-space direction into the
+    // frame this light probe's texture was authored in.
+    sample_rotation: vec4<f32>,
     // The boundaries of the simulated space used for parallax correction,
     // specified as *half* extents in light probe space.
     parallax_correction_bounds: vec3<f32>,
@@ -100,6 +106,7 @@ fn light_probe_iterator_next(iterator: ptr<function, LightProbeIterator>) -> Lig
     var result: LightProbeQueryResult;
     result.texture_index = -1;
     result.weight = 0.0;
+    result.sample_rotation = vec4<f32>(0.0, 0.0, 0.0, 1.0);
 
     while ((*iterator).current_offset < (*iterator).end_offset) {
         let light_probe_index = i32(clustered_forward::get_clusterable_object_id(
@@ -144,6 +151,9 @@ fn light_probe_iterator_next(iterator: ptr<function, LightProbeIterator>) -> Lig
         result.texture_index = light_probe.cubemap_index;
         result.intensity = light_probe.intensity;
         result.light_from_world = light_from_world;
+        result.world_from_light =
+            transpose_affine_matrix(light_probe.world_from_light_transposed);
+        result.sample_rotation = light_probe.sample_rotation;
         result.parallax_correction_bounds = light_probe.parallax_correction_bounds;
         result.flags = light_probe.flags;
         result.weight = weight;
@@ -205,6 +215,7 @@ fn light_probe_iterator_next(iterator: ptr<function, LightProbeIterator>) -> Lig
     var result: LightProbeQueryResult;
     result.texture_index = -1;
     result.weight = 0.0;
+    result.sample_rotation = vec4<f32>(0.0, 0.0, 0.0, 1.0);
 
     while (true) {
         let light_probe_index = (*iterator).current_index;
@@ -240,6 +251,9 @@ fn light_probe_iterator_next(iterator: ptr<function, LightProbeIterator>) -> Lig
         result.texture_index = light_probe.cubemap_index;
         result.intensity = light_probe.intensity;
         result.light_from_world = light_from_world;
+        result.world_from_light =
+            transpose_affine_matrix(light_probe.world_from_light_transposed);
+        result.sample_rotation = light_probe.sample_rotation;
         result.parallax_correction_bounds = light_probe.parallax_correction_bounds;
         result.flags = light_probe.flags;
         result.weight = weight;
