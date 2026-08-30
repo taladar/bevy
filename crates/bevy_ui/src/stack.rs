@@ -31,8 +31,11 @@ pub struct UiStack {
     pub uinodes: Vec<Entity>,
 }
 
+/// The reusable child-sorting buffers of [`ui_stack_system`]. Public only
+/// because the system's `Local` parameter names it, and a downstream harness
+/// that registers the exported system must be able to utter its signature.
 #[derive(Default)]
-pub(crate) struct ChildBufferCache {
+pub struct ChildBufferCache {
     pub inner: Vec<Vec<(Entity, i32)>>,
 }
 
