@@ -14,6 +14,7 @@ use bevy_input::keyboard::{KeyCode, KeyboardInput};
 use bevy_input::ButtonState;
 use bevy_input_focus::FocusedInput;
 use bevy_picking::events::{Cancel, Click, DragEnd, Pointer, Press, Release};
+use bevy_picking::pointer::PointerButton;
 use bevy_reflect::Reflect;
 use bevy_ui::{Checkable, Checked, InteractionDisabled, Pressed};
 
@@ -201,6 +202,9 @@ fn radio_button_on_click(
     q_parents: Query<&ChildOf>,
     mut commands: Commands,
 ) {
+    if click.button != PointerButton::Primary {
+        return;
+    }
     let Ok((disabled, checked)) = q_radio.get(click.entity) else {
         // Not a radio button
         return;
@@ -237,6 +241,9 @@ fn radio_button_on_pointer_down(
     q_parents: Query<&ChildOf>,
     mut commands: Commands,
 ) {
+    if press.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((radio, disabled, checked, pressed, activate_on_press)) =
         q_radio.get_mut(press.entity)
     {
@@ -260,6 +267,9 @@ fn radio_button_on_pointer_up(
     mut q_radio: Query<(Entity, Has<InteractionDisabled>, Has<Pressed>), With<RadioButton>>,
     mut commands: Commands,
 ) {
+    if release.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((radio, disabled, pressed)) = q_radio.get_mut(release.entity) {
         release.propagate(false);
         if !disabled && pressed {
@@ -273,6 +283,9 @@ fn radio_button_on_pointer_drag_end(
     mut q_radio: Query<(Entity, Has<InteractionDisabled>, Has<Pressed>), With<RadioButton>>,
     mut commands: Commands,
 ) {
+    if drag_end.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((radio, disabled, pressed)) = q_radio.get_mut(drag_end.entity) {
         drag_end.propagate(false);
         if !disabled && pressed {

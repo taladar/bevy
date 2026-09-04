@@ -14,6 +14,7 @@ use bevy_input::keyboard::{KeyCode, KeyboardInput};
 use bevy_input::ButtonState;
 use bevy_input_focus::FocusedInput;
 use bevy_picking::events::{Cancel, Click, DragEnd, Pointer, Press, Release};
+use bevy_picking::pointer::PointerButton;
 use bevy_reflect::Reflect;
 use bevy_ui::{InteractionDisabled, Pressed};
 
@@ -22,6 +23,12 @@ use crate::Activate;
 /// Headless button widget. This widget maintains a "pressed" state, which is used to
 /// indicate whether the button is currently being pressed by the user. It emits an [`Activate`]
 /// event when the button is un-pressed.
+///
+/// Only [`PointerButton::Primary`] presses the button: a secondary or middle click leaves it
+/// alone, so that the button of a pointer that is conventionally the context-menu button cannot
+/// commit an action. A control that wants to answer for another pointer button observes
+/// [`Pointer<Click>`] itself and reads [`Click::button`](bevy_picking::events::Click::button); the
+/// [`Activate`] it emits then carries that button.
 #[derive(Component, Default, Debug, Clone)]
 #[require(AccessibilityNode(accesskit::Node::new(Role::Button)))]
 #[derive(Reflect)]
@@ -50,6 +57,7 @@ fn button_on_key_event(
             event.propagate(false);
             commands.trigger(Activate {
                 entity: event.focused_entity,
+                button: None,
             });
         }
     }
@@ -63,11 +71,15 @@ fn button_on_pointer_click(
     >,
     mut commands: Commands,
 ) {
+    if click.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((pressed, disabled, activate_on_press)) = q_state.get_mut(click.entity) {
         click.propagate(false);
         if pressed && !disabled && !activate_on_press {
             commands.trigger(Activate {
                 entity: click.entity,
+                button: Some(PointerButton::Primary),
             });
         }
     }
@@ -86,12 +98,18 @@ fn button_on_pointer_down(
     >,
     mut commands: Commands,
 ) {
+    if press.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((button, disabled, pressed, activate_on_press)) = q_state.get_mut(press.entity) {
         press.propagate(false);
         if !disabled && !pressed {
             commands.entity(button).insert(Pressed);
             if activate_on_press {
-                commands.trigger(Activate { entity: button });
+                commands.trigger(Activate {
+                    entity: button,
+                    button: Some(PointerButton::Primary),
+                });
             }
         }
     }
@@ -102,6 +120,9 @@ fn button_on_pointer_up(
     mut q_state: Query<(Entity, Has<InteractionDisabled>, Has<Pressed>), With<Button>>,
     mut commands: Commands,
 ) {
+    if release.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((button, disabled, pressed)) = q_state.get_mut(release.entity) {
         release.propagate(false);
         if !disabled && pressed {
@@ -115,6 +136,9 @@ fn button_on_pointer_drag_end(
     mut q_state: Query<(Entity, Has<InteractionDisabled>, Has<Pressed>), With<Button>>,
     mut commands: Commands,
 ) {
+    if drag_end.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((button, disabled, pressed)) = q_state.get_mut(drag_end.entity) {
         drag_end.propagate(false);
         if !disabled && pressed {

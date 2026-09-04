@@ -18,6 +18,15 @@
 //! widget. The primary motivation for this is to avoid two-way data binding in scenarios where the
 //! user interface is showing a live view of dynamic data coming from deeper within the game engine.
 //!
+//! ## Pointer buttons
+//!
+//! Every widget in this crate acts on [`PointerButton::Primary`] alone. A secondary or middle
+//! click is left for whoever wants it — a context menu, a paste, a middle-click-to-open — and
+//! never presses a button, ticks a checkbox, picks a radio, selects a list row, chooses a menu
+//! item or drags a slider or scrollbar. A non-primary event is not consumed either: it is
+//! returned before the widget stops its propagation, so it still reaches an ancestor that does
+//! handle it.
+//!
 //! ## Best practices for event propagation
 //!
 //! Generally, when a widget handles an event,
@@ -51,6 +60,7 @@ pub use text_input::*;
 
 use bevy_app::{PluginGroup, PluginGroupBuilder};
 use bevy_ecs::{entity::Entity, event::EntityEvent, reflect::ReflectEvent};
+use bevy_picking::pointer::PointerButton;
 use bevy_reflect::Reflect;
 
 use crate::popover::PopoverPlugin;
@@ -82,6 +92,15 @@ impl PluginGroup for UiWidgetsPlugins {
 pub struct Activate {
     /// The activated entity.
     pub entity: Entity,
+    /// The pointer button that activated it, or `None` when it was activated by the keyboard
+    /// (or by code triggering the event directly).
+    ///
+    /// The widgets in this crate only activate on [`PointerButton::Primary`], so this is
+    /// `Some(PointerButton::Primary)` or `None` for anything they emit. It is carried so that a
+    /// control which observes the pointer itself — in order to answer for the secondary button,
+    /// say — can raise an [`Activate`] that says which button it was, instead of the information
+    /// being thrown away at this boundary.
+    pub button: Option<PointerButton>,
 }
 
 /// Notification sent by a widget that edits a scalar value.

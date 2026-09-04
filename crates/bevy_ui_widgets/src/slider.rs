@@ -22,6 +22,7 @@ use bevy_input_focus::FocusedInput;
 use bevy_log::warn_once;
 use bevy_math::ops;
 use bevy_picking::events::{Cancel, Drag, DragEnd, DragStart, Pointer, Press, Release};
+use bevy_picking::pointer::PointerButton;
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_ui::{
     ComputedNode, ComputedUiRenderTargetInfo, InteractionDisabled, Pressed, UiGlobalTransform,
@@ -271,6 +272,9 @@ pub(crate) fn slider_on_pointer_down(
     mut commands: Commands,
     ui_scale: Res<UiScale>,
 ) {
+    if press.button != PointerButton::Primary {
+        return;
+    }
     if q_thumb.contains(press.entity) {
         // Thumb click, stop propagation to prevent track click.
         press.propagate(false);
@@ -375,6 +379,9 @@ pub(crate) fn slider_on_drag_start(
         With<Slider>,
     >,
 ) {
+    if drag_start.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((value, mut drag, disabled)) = q_slider.get_mut(drag_start.entity) {
         drag_start.propagate(false);
         if !disabled {
@@ -403,6 +410,9 @@ pub(crate) fn slider_on_drag(
     mut commands: Commands,
     ui_scale: Res<UiScale>,
 ) {
+    if event.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((slider, node, range, precision, transform, drag, disabled)) =
         q_slider.get(event.entity)
     {
@@ -447,6 +457,9 @@ pub(crate) fn slider_on_drag_end(
     mut commands: Commands,
     ui_scale: Res<UiScale>,
 ) {
+    if drag_end.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((slider_ent, slider, node, range, precision, transform, mut drag, disabled)) =
         q_slider.get_mut(drag_end.entity)
     {
@@ -542,6 +555,9 @@ fn slider_on_pointer_up(
     mut q_slider: Query<(Entity, Has<InteractionDisabled>, Has<Pressed>), With<Slider>>,
     mut commands: Commands,
 ) {
+    if release.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((slider, disabled, pressed)) = q_slider.get_mut(release.entity) {
         release.propagate(false);
         if !disabled && pressed {

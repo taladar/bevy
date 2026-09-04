@@ -15,6 +15,7 @@ use bevy_ecs::{
 };
 use bevy_math::{Affine2, Vec2};
 use bevy_picking::events::{Cancel, Drag, DragEnd, DragStart, Pointer, Press};
+use bevy_picking::pointer::PointerButton;
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_ui::{
     prelude::BorderRect, ui_layout_system, BackgroundColor, BorderColor, BorderRadius,
@@ -148,6 +149,9 @@ fn scrollbar_on_pointer_down(
     mut q_scroll_pos: Query<(&mut ScrollPosition, &ComputedNode), Without<Scrollbar>>,
     ui_scale: Res<UiScale>,
 ) {
+    if ev.button != PointerButton::Primary {
+        return;
+    }
     if q_thumb.contains(ev.entity) {
         // If they click on the thumb, do nothing. This will be handled by the drag event.
         ev.propagate(false);
@@ -199,6 +203,9 @@ fn scrollbar_on_drag_start(
     q_scrollbar: Query<&Scrollbar>,
     q_scroll_area: Query<&ScrollPosition>,
 ) {
+    if ev.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((ChildOf(thumb_parent), mut drag)) = q_thumb.get_mut(ev.entity) {
         ev.propagate(false);
         if let Ok(scrollbar) = q_scrollbar.get(*thumb_parent)
@@ -220,6 +227,9 @@ fn scrollbar_on_drag(
     mut q_scroll_pos: Query<(&mut ScrollPosition, &ComputedNode), Without<Scrollbar>>,
     ui_scale: Res<UiScale>,
 ) {
+    if ev.button != PointerButton::Primary {
+        return;
+    }
     if let Ok((ChildOf(thumb_parent), drag)) = q_thumb.get_mut(ev.entity)
         && let Ok((node, scrollbar)) = q_scrollbar.get_mut(*thumb_parent)
     {
@@ -259,6 +269,9 @@ fn scrollbar_on_drag_end(
     mut ev: On<Pointer<DragEnd>>,
     mut q_thumb: Query<&mut ScrollbarDragState, With<ScrollbarThumb>>,
 ) {
+    if ev.button != PointerButton::Primary {
+        return;
+    }
     if let Ok(mut drag) = q_thumb.get_mut(ev.entity) {
         ev.propagate(false);
         if drag.dragging {

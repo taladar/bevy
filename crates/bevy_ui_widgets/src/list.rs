@@ -14,6 +14,7 @@ use bevy_input::keyboard::{KeyCode, KeyboardInput};
 use bevy_input::ButtonState;
 use bevy_input_focus::{FocusGained, FocusLost, FocusedInput, InputFocusVisible};
 use bevy_picking::events::{Click, Pointer};
+use bevy_picking::pointer::PointerButton;
 use bevy_reflect::Reflect;
 use bevy_ui::{InteractionDisabled, Selectable, Selected};
 
@@ -179,6 +180,9 @@ fn listbox_on_row_click(
     q_children: Query<&Children>,
     mut commands: Commands,
 ) {
+    if ev.button != PointerButton::Primary {
+        return;
+    }
     if q_listbox.contains(ev.entity) {
         // Processing clicks at the listbox level, not the list item level, so that we can
         // do exclusion. Starting with the original target, search upward for a list row.
