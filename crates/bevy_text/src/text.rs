@@ -88,6 +88,22 @@ impl ComputedTextBlock {
         &self.entities
     }
 
+    /// Sets the entities a glyph's `section_index` resolves against.
+    ///
+    /// The text pipeline fills these in for a [`Text`](crate::Text) block from
+    /// its span hierarchy, and nothing else needs to touch them. An
+    /// [`EditableText`](crate::EditableText) field has no spans — its content is
+    /// one buffer with one style — so a widget that gives parley a *per-range*
+    /// brush over that buffer has no way to say what a brush's section index
+    /// means. This lets such a widget name one entity per section itself, so the
+    /// renderer resolves each range's [`TextColor`](crate::TextColor),
+    /// [`Underline`](crate::Underline) and friends the same way it resolves a
+    /// text span's.
+    pub fn set_entities(&mut self, entities: impl IntoIterator<Item = TextEntity>) {
+        self.entities.clear();
+        self.entities.extend(entities);
+    }
+
     /// Indicates if the text needs to be refreshed in [`TextLayoutInfo`].
     ///
     /// Updated automatically by [`detect_text_needs_rerender`] and cleared
