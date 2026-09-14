@@ -578,8 +578,27 @@ fn layout_with_bounds(layout: &mut Layout<TextBrush>, bounds: TextBounds, justif
 }
 
 /// Calculate the size of the text area for the given buffer.
+///
+/// Trailing whitespace counts toward the width only where it **fits inside the
+/// width the layout was broken at**, which is what tells `Layout::full_width`
+/// (whitespace included) from `Layout::width` (excluded) apart here.
+///
+/// This is what sizes a UI node, so both halves matter. A soft wrap *hangs* the
+/// space it broke at past the wrap width — CSS does the same — so `full_width`
+/// alone is routinely wider than the bounds the layout was given, by up to one
+/// space advance or roughly a quarter em, and a node sized from it reports more
+/// content than the box it was just fitted to, an error every ancestor then
+/// inherits. `width` alone is no better: it shrinks an *unbounded* run to its
+/// ink, and a run with a trailing space laid out again at exactly that width
+/// breaks at the space it can no longer hold, taking a line it does not draw.
 fn buffer_dimensions(buffer: &Layout<TextBrush>) -> Vec2 {
-    let size = Vec2::new(buffer.full_width(), buffer.height());
+    let full_width = buffer.full_width();
+    let width = if full_width <= buffer.layout_max_advance() {
+        full_width
+    } else {
+        buffer.width()
+    };
+    let size = Vec2::new(width, buffer.height());
     if size.is_finite() {
         size.ceil()
     } else {
