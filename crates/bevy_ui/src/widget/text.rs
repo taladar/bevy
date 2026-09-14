@@ -191,20 +191,30 @@ impl Measure for TextMeasure {
             ..
         } = measure_args;
 
-        let x = width
-            .effective
-            .unwrap_or_else(|| match available_width {
-                AvailableSpace::Definite(x) => {
-                    // It is possible for the "min content width" to be larger than
-                    // the "max content width" when soft-wrapping right-aligned text
-                    // and possibly other situations.
+        // The width the text is wrapped at is a *content box* width, and the
+        // only content-box width in these arguments is `available_width`:
+        // taffy subtracts the node's own padding, border and scrollbar gutter
+        // from it before calling the measure, and substitutes the node's known
+        // or styled width for the parent's available space when there is one.
+        //
+        // `known_width` (and with it `width.effective`) is the *border box*,
+        // and wrapping the text at that width over-measures by the node's own
+        // horizontal padding and border: the height comes back for a wrap the
+        // renderer never performs, so a `Text` node carrying its own padding is
+        // laid out shorter than the text it then draws at the narrower content
+        // box — one line short per padding's worth of extra width.
+        let x = match available_width {
+            AvailableSpace::Definite(x) => {
+                // It is possible for the "min content width" to be larger than
+                // the "max content width" when soft-wrapping right-aligned text
+                // and possibly other situations.
 
-                    x.max(self.info.min.x).min(self.info.max.x)
-                }
-                AvailableSpace::MinContent => self.info.min.x,
-                AvailableSpace::MaxContent => self.info.max.x,
-            })
-            .maybe_clamp(width.min, width.max);
+                x.max(self.info.min.x).min(self.info.max.x)
+            }
+            AvailableSpace::MinContent => self.info.min.x,
+            AvailableSpace::MaxContent => self.info.max.x,
+        }
+        .maybe_clamp(width.min, width.max);
 
         let size = height.effective.map_or_else(
             || match available_width {
