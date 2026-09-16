@@ -60,7 +60,10 @@ use bevy_render::{
     Extract,
 };
 use bevy_render::{mesh::allocator::MeshAllocator, sync_world::MainEntityHashMap};
-use bevy_render::{texture::FallbackImage, view::RenderVisibleEntities};
+use bevy_render::{
+    texture::{FallbackImage, GpuImage},
+    view::RenderVisibleEntities,
+};
 use bevy_shader::ShaderDefVal;
 use bevy_utils::Parallel;
 use core::{
@@ -376,7 +379,12 @@ where
         app.init_asset::<M>()
             .register_type::<MeshMaterial3d<M>>()
             .init_resource::<EntitiesNeedingSpecialization<M>>()
-            .add_plugins((ErasedRenderAssetPlugin::<MeshMaterial3d<M>>::default(),))
+            .add_plugins((
+                // A material binds the prepared image of each texture it samples,
+                // so it must be prepared after them — or a same-handle image
+                // replacement can leave it bound to the old texture view.
+                ErasedRenderAssetPlugin::<MeshMaterial3d<M>, GpuImage>::default(),
+            ))
             .add_systems(
                 PostUpdate,
                 (

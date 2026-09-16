@@ -13,7 +13,8 @@ use bevy_ecs::{
 };
 use bevy_log::{debug, error};
 use bevy_platform::collections::{HashMap, HashSet};
-use bevy_render::render_asset::RenderAssetBytesPerFrameLimiter;
+use bevy_render::render_asset::{prepare_assets, RenderAssetBytesPerFrameLimiter};
+use bevy_render::texture::GpuImage;
 use core::marker::PhantomData;
 use thiserror::Error;
 
@@ -94,8 +95,8 @@ pub trait ErasedRenderAsset: Send + Sync + 'static {
 ///
 /// The `AFTER` generic parameter can be used to specify that `A::prepare_asset` should not be run until
 /// `prepare_assets::<AFTER>` has completed. This allows the `prepare_asset` function to depend on another
-/// prepared [`ErasedRenderAsset`], for example `Mesh::prepare_asset` relies on `ErasedRenderAssets::<GpuImage>` for morph
-/// targets, so the plugin is created as `ErasedRenderAssetPlugin::<RenderMesh, GpuImage>::default()`.
+/// prepared [`ErasedRenderAsset`] — or on [`GpuImage`]s, as every material does for its textures, so
+/// `MaterialPlugin` creates its plugin as `ErasedRenderAssetPlugin::<MeshMaterial3d<M>, GpuImage>::default()`.
 pub struct ErasedRenderAssetPlugin<
     A: ErasedRenderAsset,
     AFTER: ErasedRenderAssetDependency + 'static = (),
@@ -157,6 +158,20 @@ impl ErasedRenderAssetDependency for () {
 impl<A: ErasedRenderAsset> ErasedRenderAssetDependency for A {
     fn register_system(render_app: &mut SubApp, system: ScheduleConfigs<ScheduleSystem>) {
         render_app.add_systems(Render, system.after(prepare_erased_assets::<A>));
+    }
+}
+
+/// Orders an erased asset's preparation after the [`GpuImage`]s it samples.
+///
+/// A material binds the [`GpuImage`] prepared for each of its texture handles,
+/// and [`prepare_assets::<GpuImage>`] replaces that entry when the image behind a
+/// handle changes. Without this ordering the two systems run in either order
+/// within [`RenderSystems::PrepareAssets`], so a frame that re-prepares a material
+/// together with a replaced image of a different size can bind the *old* texture
+/// view, and nothing prepares the material again to correct it.
+impl ErasedRenderAssetDependency for GpuImage {
+    fn register_system(render_app: &mut SubApp, system: ScheduleConfigs<ScheduleSystem>) {
+        render_app.add_systems(Render, system.after(prepare_assets::<GpuImage>));
     }
 }
 
