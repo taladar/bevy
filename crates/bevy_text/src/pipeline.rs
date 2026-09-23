@@ -93,6 +93,10 @@ impl TextPipeline {
             .map(|_| -> TextSectionView<'_> { unreachable!() })
             .collect();
 
+        // The first span's style, whether or not it has text in it — see where
+        // it is filled in below.
+        let mut block_style: Option<TextSectionView<'_>> = None;
+
         let result = {
             for (index, (entity, depth, text, text_font, _color, line_height, letter_spacing)) in
                 text_spans.enumerate()
@@ -112,10 +116,6 @@ impl TextPipeline {
                     font_smoothing: text_font.font_smoothing,
                 });
 
-                if text.is_empty() {
-                    continue;
-                }
-
                 if matches!(text_font.font, FontSource::Handle(_))
                     && resolve_font_source(text_font, fonts).is_err()
                 {
@@ -125,6 +125,25 @@ impl TextPipeline {
                 let font_size = text_font
                     .font_size
                     .eval(logical_viewport_size, base_rem_size);
+
+                // The first span's style, kept whether or not it has text in
+                // it: a block holding no characters has no *section* to style,
+                // and is laid out at the defaults pushed below rather than at
+                // parley's own.
+                if block_style.is_none() {
+                    block_style = Some(TextSectionView {
+                        index,
+                        text,
+                        text_font,
+                        font_size,
+                        line_height,
+                        letter_spacing,
+                    });
+                }
+
+                if text.is_empty() {
+                    continue;
+                }
 
                 if font_size <= 0.0 {
                     warn_once!(
@@ -178,6 +197,35 @@ impl TextPipeline {
                 LineBreak::WordBoundary => {
                     builder.push_default(StyleProperty::WordBreak(WordBreak::Normal));
                 }
+            }
+
+            // The first section's style, as the layout's **defaults**, so a
+            // block with no characters in it is still measured at the font it
+            // asked for.
+            //
+            // Every style below is pushed over a *range*, and an empty range is
+            // skipped, so text holding no characters reached parley with nothing
+            // said about it at all and was laid out at parley's own defaults — a
+            // 20 px line whatever the node declared. That is not a cosmetic
+            // difference: an empty `Text` is how a `content`-driven glyph is
+            // spawned (a checkbox's tick, a radio's pip), and the line it
+            // reports is what its parent is sized to, so a 14 px box measured
+            // 20 px of content and overflowed itself. CSS says an empty inline
+            // box still has its own font's line box; this is that.
+            //
+            // The ranged pushes still win for every non-empty span, so nothing
+            // about a block that *has* text changes.
+            if let Some(first) = block_style.as_ref() {
+                let resolved_family = resolve_font_source(first.text_font, fonts)?;
+                builder.push_default(StyleProperty::FontFamily(resolved_family));
+                builder.push_default(StyleProperty::FontSize(first.font_size));
+                builder.push_default(StyleProperty::LineHeight(first.line_height.eval()));
+                builder.push_default(StyleProperty::LetterSpacing(
+                    first.letter_spacing.eval(base_rem_size),
+                ));
+                builder.push_default(StyleProperty::FontWeight(first.text_font.weight.into()));
+                builder.push_default(StyleProperty::FontWidth(first.text_font.width.into()));
+                builder.push_default(StyleProperty::FontStyle(first.text_font.style.into()));
             }
 
             let mut start = 0;
