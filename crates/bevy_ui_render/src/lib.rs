@@ -1139,6 +1139,14 @@ pub fn extract_text_shadows(
             continue;
         }
 
+        // A fully transparent shadow draws nothing, so do not extract a second
+        // copy of every glyph (and decoration) for it. This is what a stylesheet
+        // produces for `text-shadow: none`, which a theme sets on every label it
+        // does not want shadowed, so it is the common case rather than a corner.
+        if shadow.color.alpha() <= 0. {
+            continue;
+        }
+
         let Some(extracted_camera_entity) = camera_mapper.map(target) else {
             continue;
         };
