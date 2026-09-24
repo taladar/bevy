@@ -599,6 +599,7 @@ pub fn prepare_ui_slices(
                     let [slices, border, repeat] = compute_texture_slices(
                         image_size,
                         uinode_rect.size() * texture_slices.inverse_scale_factor,
+                        texture_slices.inverse_scale_factor,
                         &texture_slices.image_scale_mode,
                     );
 
@@ -721,9 +722,46 @@ impl<P: PhaseItem> RenderCommand<P> for DrawSlicer {
     }
 }
 
+/// The corner scale of a nine-sliced image, snapped so each texel of a corner
+/// or an edge band covers a whole number of **physical** pixels.
+///
+/// `min_coeff` is the corner scale in logical pixels per texel. At a fractional
+/// scale factor it puts texel edges between physical pixels — at 1.5 an 8-texel
+/// corner spans 12 pixels and a texel edge falls every 1.5, exactly on some
+/// pixel centres. Which texel such a pixel takes is then decided by the last
+/// bit of the interpolated UV, and the two triangles of the quad interpolate it
+/// differently, so a 1-texel frame drawn nearest came out 1 pixel thick on one
+/// side of the quad's diagonal and 2 on the other.
+///
+/// So when a corner texel covers at least one physical pixel, it is rounded to
+/// the nearest whole number of them (never so far up that the corners no
+/// longer fit the node); a corner already shrunk below one pixel per texel has
+/// no whole-pixel scale to snap to and is left alone.
+fn whole_pixel_corner_scale(
+    min_coeff: f32,
+    image_size: Vec2,
+    target_size: Vec2,
+    inverse_scale_factor: f32,
+) -> f32 {
+    let physical = min_coeff / inverse_scale_factor;
+    if !physical.is_finite() || physical < 1. {
+        return min_coeff;
+    }
+    let fits = (target_size / inverse_scale_factor / image_size)
+        .min_element()
+        .floor();
+    let snapped = physical.round().min(fits);
+    if snapped >= 1. {
+        snapped * inverse_scale_factor
+    } else {
+        min_coeff
+    }
+}
+
 fn compute_texture_slices(
     image_size: Vec2,
     target_size: Vec2,
+    inverse_scale_factor: f32,
     image_scale_mode: &SpriteImageMode,
 ) -> [[f32; 4]; 3] {
     match image_scale_mode {
@@ -733,9 +771,14 @@ fn compute_texture_slices(
             sides_scale_mode,
             max_corner_scale,
         }) => {
-            let min_coeff = (target_size / image_size)
-                .min_element()
-                .min(*max_corner_scale);
+            let min_coeff = whole_pixel_corner_scale(
+                (target_size / image_size)
+                    .min_element()
+                    .min(*max_corner_scale),
+                image_size,
+                target_size,
+                inverse_scale_factor,
+            );
 
             // calculate the normalized extents of the nine-patched image slices
             let slices = [
@@ -814,5 +857,93 @@ fn compute_tiled_subaxis(image_extent: f32, target_extent: f32, mode: &SliceScal
             let s = image_extent * *stretch_value;
             target_extent / s
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_texture_slices;
+    use bevy_math::Vec2;
+    use bevy_sprite::{BorderRect, SpriteImageMode, TextureSlicer};
+
+    /// The widths, in physical pixels, of the leading and trailing corner bands
+    /// along x and y that `compute_texture_slices` gives a sliced `image` in a
+    /// node of `logical` size at `scale`.
+    fn corner_bands(image: Vec2, inset: f32, logical: Vec2, scale: f32) -> [f32; 4] {
+        let mode = SpriteImageMode::Sliced(TextureSlicer {
+            border: BorderRect::all(inset),
+            ..Default::default()
+        });
+        let [_slices, border, _repeat] = compute_texture_slices(image, logical, 1. / scale, &mode);
+        let physical = logical * scale;
+        [
+            border[0] * physical.x,
+            border[1] * physical.y,
+            (1. - border[2]) * physical.x,
+            (1. - border[3]) * physical.y,
+        ]
+    }
+
+    fn assert_bands(bands: [f32; 4], expected: f32) {
+        for band in bands {
+            assert!(
+                (band - expected).abs() < 1e-3,
+                "a corner band of {band} px, expected {expected}: {bands:?}"
+            );
+        }
+    }
+
+    /// At a fractional scale every corner band is a whole number of physical
+    /// pixels per texel: an 8-texel corner at 1.5 rounds to 2 pixels a texel
+    /// (16 px) rather than 12 px, where a texel edge would sit on a pixel
+    /// centre. The node is the wide, short button the seam was seen on.
+    #[test]
+    fn a_fractional_scale_snaps_corners_to_whole_pixels_per_texel() {
+        let image = Vec2::splat(24.);
+        let button = Vec2::new(733., 33.);
+        assert_bands(corner_bands(image, 8., button, 1.5), 16.);
+        assert_bands(corner_bands(image, 8., button, 1.25), 8.);
+        assert_bands(corner_bands(image, 8., button, 1.75), 16.);
+    }
+
+    /// Whole scales are untouched: one and two pixels a texel.
+    #[test]
+    fn a_whole_scale_is_unchanged() {
+        let image = Vec2::splat(24.);
+        let button = Vec2::new(200., 32.);
+        assert_bands(corner_bands(image, 8., button, 1.), 8.);
+        assert_bands(corner_bands(image, 8., button, 2.), 16.);
+    }
+
+    /// Rounding up never makes the corners overrun the node: a node only just
+    /// big enough for the art at 1.5 keeps a scale its corners fit in.
+    #[test]
+    fn a_snapped_corner_still_fits_the_node() {
+        let image = Vec2::splat(24.);
+        // 24 logical = 36 physical at 1.5: two pixels a texel (48) would not fit.
+        assert_bands(corner_bands(image, 8., Vec2::splat(24.), 1.5), 8.);
+    }
+
+    /// A corner already shrunk below a pixel a texel (the node is smaller than
+    /// the art) has no whole-pixel scale and keeps the shrink it had.
+    #[test]
+    fn a_shrunk_corner_is_left_alone() {
+        let image = Vec2::splat(24.);
+        let tiny = Vec2::splat(12.);
+        // min_coeff 0.5 at scale 1: 4 physical px per 8-texel corner.
+        assert_bands(corner_bands(image, 8., tiny, 1.), 4.);
+    }
+
+    /// Tiling is not sliced and ignores the scale factor.
+    #[test]
+    fn tiling_ignores_the_scale_factor() {
+        let mode = SpriteImageMode::Tiled {
+            tile_x: true,
+            tile_y: true,
+            stretch_value: 1.,
+        };
+        let a = compute_texture_slices(Vec2::splat(24.), Vec2::splat(96.), 1., &mode);
+        let b = compute_texture_slices(Vec2::splat(24.), Vec2::splat(96.), 1. / 1.5, &mode);
+        assert_eq!(a, b);
     }
 }
