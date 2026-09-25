@@ -290,8 +290,40 @@ pub fn update_editable_text_layout(
         mut generation,
     ) in input_field_query.iter_mut()
     {
+        // A field that is not focused, and whose text, box, hinting and target
+        // are as they were, has nothing to refresh: its layout, glyphs and
+        // (hidden) cursor are exactly what the last pass left. Only the focused
+        // field needs a visit every frame — its cursor blinks — and a field that
+        // just lost focus needs one more, to hide its cursor.
+        let focused = input_focus
+            .as_ref()
+            .is_some_and(|input_focus| input_focus.get() == Some(entity));
+        let focus_changed = input_focus
+            .as_ref()
+            .is_some_and(|input_focus| input_focus.is_changed());
+        if !(focused
+            || focus_changed
+            || editable_text.is_changed()
+            || computed_node.is_changed()
+            || hinting.is_changed()
+            || target.is_changed())
+        {
+            continue;
+        }
+
         let cursor_width = editable_text.cursor_width;
         let cursor_blink_period = editable_text.cursor_blink_period;
+
+        // What it does to the editor is internal bookkeeping: a width that follows the node
+        // it already lays out in, and a refresh of the editor's cached layout.
+        // Doing that through `DerefMut` flagged `EditableText` as changed on
+        // every frame for every field, so `update_editable_text_content_size`
+        // re-set every field's `ContentSize`, which dirtied the field and all
+        // its ancestors in taffy — the whole UI was laid out again, and its text
+        // re-measured, on every frame. A real change to the layout is tracked by
+        // `EditableTextGeneration` below; a real change to the text arrives
+        // through the editing systems, which still flag it.
+        let editable_text = editable_text.bypass_change_detection();
 
         if computed_node.is_changed() {
             editable_text
@@ -469,19 +501,28 @@ pub fn update_editable_text_layout(
                 *cursor_timer = Duration::ZERO;
             }
 
-            info.cursor = driver
+            let cursor = driver
                 .editor
                 .cursor_geometry(
                     cursor_width * text_font.font_size.eval(target.logical_size(), rem_size.0),
                 )
                 .map(bounding_box_to_rect)
                 .map(|rect| (*cursor_timer < cursor_blink_period / 2, rect));
+            if info.cursor != cursor {
+                info.cursor = cursor;
+            }
         } else {
-            info.cursor = driver
+            // Written only when it differs, for the same reason as above: an
+            // unconditional write flagged every unfocused field's layout info
+            // as changed on every frame.
+            let cursor = driver
                 .editor
                 .cursor_geometry(0.)
                 .map(bounding_box_to_rect)
                 .map(|rect| (false, rect));
+            if info.cursor != cursor {
+                info.cursor = cursor;
+            }
         }
     }
 }
