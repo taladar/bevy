@@ -2922,6 +2922,29 @@ impl Default for LayoutConfig {
     }
 }
 
+/// Lays this [`Node`] and its descendants out as a **layout root of its own**,
+/// independently of its parent's layout.
+///
+/// The node stays a child of its parent in the entity hierarchy — it inherits
+/// from it, is picked, stacked and clipped through it — but it is not one of
+/// the parent's layout children: it takes no space in the parent's flow and
+/// does not contribute to the parent's content size. It is laid out against
+/// the render target's viewport (so a percentage size or inset is a
+/// percentage of the viewport, not of the parent) and then placed at its
+/// layout position relative to the parent's top-left corner, as an
+/// absolutely positioned child would be.
+///
+/// What that buys is **isolation**: a change inside the node re-lays-out only
+/// the node's own subtree, and a change elsewhere in the UI does not re-lay-out
+/// it. A floating window is the intended use — a change inside one window
+/// should cost that window's layout, not the whole screen's.
+///
+/// A node under an ancestor with [`Display::None`] is hidden with it: its
+/// subtree is given a zero size, as it would have been as a layout child.
+#[derive(Component, Copy, Clone, Debug, Default, PartialEq, Eq, Reflect)]
+#[reflect(Component, Debug, PartialEq, Default, Clone)]
+pub struct IndependentLayout;
+
 /// Indicates that this root [`Node`] entity should be rendered to a specific camera.
 ///
 /// UI then will be laid out respecting the camera's viewport and scale factor, and

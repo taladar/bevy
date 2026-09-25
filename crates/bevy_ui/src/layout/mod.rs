@@ -3,18 +3,16 @@ use crate::experimental::GhostNode;
 use crate::{
     experimental::{UiChildren, UiRootNodes},
     ui_transform::{UiGlobalTransform, UiTransform},
-    ComputedNode, ComputedUiRenderTargetInfo, ContentSize, Display, IgnoreScroll, LayoutConfig,
-    Node, Outline, OverflowAxis, ScrollPosition,
+    ComputedNode, ComputedUiRenderTargetInfo, ContentSize, Display, IgnoreScroll,
+    IndependentLayout, LayoutConfig, Node, Outline, OverflowAxis, ScrollPosition,
 };
-#[cfg(feature = "ghost_nodes")]
-use bevy_ecs::query::With;
 use bevy_ecs::{
     change_detection::{DetectChanges, DetectChangesMut},
-    entity::Entity,
-    hierarchy::Children,
+    entity::{Entity, EntityHashMap, EntityHashSet},
+    hierarchy::{ChildOf, Children},
     lifecycle::RemovedComponents,
-    query::Added,
-    system::{Query, ResMut},
+    query::{Added, Changed, Or, With},
+    system::{Local, Query, ResMut, SystemParam},
     world::Ref,
 };
 
@@ -73,7 +71,131 @@ pub enum LayoutError {
     TaffyError(taffy::tree::TaffyError),
 }
 
-/// Updates the UI's layout tree, computes the new layout geometry and then updates the sizes and transforms of all the UI nodes.
+/// What an [`IndependentLayout`] root was last placed against: its parent's
+/// global transform, size and scroll position, and whether an ancestor was
+/// hidden. A root none of whose own nodes changed is placed again only when
+/// one of these did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IndependentPlacement {
+    parent_transform: Affine2,
+    parent_size: Vec2,
+    parent_scroll: Vec2,
+    hidden: bool,
+}
+
+/// The queries [`ui_layout_system`] finds its **dirty layout roots** with.
+///
+/// A layout root is a root [`Node`] or an [`IndependentLayout`] node. A change
+/// to a node dirties the layout root it belongs to — the nearest ancestor (or
+/// itself) that is one — and only dirty roots are synced, laid out and
+/// placed.
+#[derive(SystemParam)]
+pub struct LayoutRoots<'w, 's> {
+    /// Every independent layout root.
+    independent: Query<'w, 's, (), With<IndependentLayout>>,
+    /// Nodes that became independent this frame.
+    added_independent: Query<'w, 's, Entity, Added<IndependentLayout>>,
+    /// Nodes that stopped being independent.
+    removed_independent: RemovedComponents<'w, 's, IndependentLayout>,
+    /// The hierarchy, walked up to find a node's layout root.
+    parents: Query<'w, 's, &'static ChildOf>,
+    /// UI nodes, for the walk and the hidden-ancestor check.
+    nodes: Query<'w, 's, &'static Node>,
+    /// Nodes whose children changed.
+    changed_children: Query<'w, 's, Entity, (Changed<Children>, With<Node>)>,
+    /// Nodes moved to another parent: their new layout root is dirty (their
+    /// old one is, through the old parent's children changing).
+    changed_parent: Query<'w, 's, Entity, (Changed<ChildOf>, With<Node>)>,
+    /// Nodes un-parented: each is now a root of its own, to be laid out.
+    removed_parent: RemovedComponents<'w, 's, ChildOf>,
+    /// Nodes whose geometry inputs (not their layout) changed.
+    changed_geometry: Query<
+        'w,
+        's,
+        Entity,
+        (
+            With<Node>,
+            Or<(
+                Changed<ScrollPosition>,
+                Changed<UiTransform>,
+                Changed<Outline>,
+                Changed<LayoutConfig>,
+                Changed<IgnoreScroll>,
+            )>,
+        ),
+    >,
+}
+
+impl LayoutRoots<'_, '_> {
+    /// The layout root `entity` belongs to: the nearest of itself and its
+    /// ancestors that is an [`IndependentLayout`] node or has no UI parent.
+    fn root_of(&self, entity: Entity, memo: &mut EntityHashMap<Entity>) -> Entity {
+        let mut walked = Vec::new();
+        let mut current = entity;
+        let root = loop {
+            if let Some(root) = memo.get(&current) {
+                break *root;
+            }
+            walked.push(current);
+            if self.independent.contains(current) {
+                break current;
+            }
+            match self.parents.get(current) {
+                Ok(parent) if self.nodes.contains(parent.parent()) => current = parent.parent(),
+                _ => break current,
+            }
+        };
+        for node in walked {
+            memo.insert(node, root);
+        }
+        root
+    }
+
+    /// The UI parent of `entity`, if it has one.
+    fn parent_of(&self, entity: Entity) -> Option<Entity> {
+        self.parents
+            .get(entity)
+            .ok()
+            .map(ChildOf::parent)
+            .filter(|parent| self.nodes.contains(*parent))
+    }
+
+    /// Whether any strict UI ancestor of `entity` has [`Display::None`].
+    fn ancestor_hidden(&self, entity: Entity) -> bool {
+        let mut current = entity;
+        while let Some(parent) = self.parent_of(current) {
+            if self
+                .nodes
+                .get(parent)
+                .is_ok_and(|node| node.display == Display::None)
+            {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    /// How many UI ancestors `entity` has.
+    fn depth(&self, entity: Entity) -> usize {
+        let mut depth = 0;
+        let mut current = entity;
+        while let Some(parent) = self.parent_of(current) {
+            depth += 1;
+            current = parent;
+        }
+        depth
+    }
+}
+
+/// Updates the UI's layout tree, computes the new layout geometry and then updates the sizes and transforms of the UI nodes.
+///
+/// Only **dirty layout roots** are processed: a layout root is a root [`Node`]
+/// or an [`IndependentLayout`] node, and a change to any node (its `Node`, its
+/// measure, its render target, its children, or one of the inputs to its
+/// placement) dirties the root it belongs to. An independent root whose own
+/// nodes did not change is placed again only when its parent moved, resized,
+/// scrolled, or an ancestor was hidden or shown.
 pub fn ui_layout_system(
     mut ui_surface: ResMut<UiSurface>,
     ui_root_node_query: UiRootNodes,
@@ -102,12 +224,19 @@ pub fn ui_layout_system(
     #[cfg(feature = "ghost_nodes")] mut removed_ghost_nodes: RemovedComponents<GhostNode>,
     #[cfg(feature = "ghost_nodes")] added_ghost_node_query: Query<Entity, Added<GhostNode>>,
     #[cfg(feature = "ghost_nodes")] ghost_node_query: Query<(), With<GhostNode>>,
+    mut roots: LayoutRoots,
+    mut placed: Local<EntityHashMap<IndependentPlacement>>,
 ) {
+    // Every node whose layout or placement changed, mapped to its layout root
+    // below.
+    let mut changed_nodes: Vec<Entity> = Vec::new();
+
     // Sync Node and ContentSize to Taffy for all nodes
     node_query
         .iter_mut()
         .for_each(|(entity, node, mut content_size, computed_target)| {
             if computed_target.is_changed() || node.is_changed() || content_size.is_changed() {
+                changed_nodes.push(entity);
                 let layout_context = LayoutContext::new(
                     computed_target.scale_factor,
                     computed_target.physical_size.as_vec2(),
@@ -125,6 +254,7 @@ pub fn ui_layout_system(
     {
         for entity in removed_children.read() {
             ui_surface.try_remove_children(entity);
+            changed_nodes.push(entity);
         }
     }
 
@@ -143,6 +273,7 @@ pub fn ui_layout_system(
 
         for entity in removed_children.read() {
             ui_surface.try_remove_children(entity);
+            changed_nodes.push(entity);
             if ghost_node_query.contains(entity)
                 && let Some(parent) = ui_children.get_parent(entity)
             {
@@ -158,36 +289,57 @@ pub fn ui_layout_system(
             .filter(|entity| !node_query.contains(*entity)),
     );
 
-    for ui_root_entity in ui_root_node_query.iter() {
-        fn update_children_recursively(
-            ui_surface: &mut UiSurface,
-            ui_children: &UiChildren,
-            added_node_query: &Query<(), Added<Node>>,
-            entity: Entity,
-        ) {
-            let children_changed = ui_children.is_changed(entity)
-                || ui_children
-                    .iter_ui_children(entity)
-                    .any(|child| added_node_query.contains(child));
-            #[cfg(feature = "ghost_nodes")]
-            let children_changed =
-                children_changed || ui_surface.dirty_ghost_children_scratch.contains(&entity);
+    placed.retain(|entity, _| node_query.contains(*entity));
 
-            if ui_surface.entity_to_taffy.contains_key(&entity)
-                && (added_node_query.contains(entity) || children_changed)
-            {
-                ui_surface.update_children(entity, ui_children.iter_ui_children(entity));
-            }
-
-            for child in ui_children.iter_ui_children(entity) {
-                update_children_recursively(ui_surface, ui_children, added_node_query, child);
-            }
+    // A node gaining or losing `IndependentLayout` leaves or rejoins its
+    // parent's layout children: the parent's children are synced again, and
+    // both the parent's root and the node's own are dirty.
+    let mut resync_children_of = EntityHashSet::default();
+    let independence_changed: Vec<Entity> = roots
+        .added_independent
+        .iter()
+        .chain(roots.removed_independent.read())
+        .filter(|entity| node_query.contains(*entity))
+        .collect();
+    for entity in independence_changed {
+        changed_nodes.push(entity);
+        if let Some(parent) = roots.parent_of(entity) {
+            resync_children_of.insert(parent);
+            changed_nodes.push(parent);
         }
+    }
+    changed_nodes.extend(roots.changed_children.iter());
+    changed_nodes.extend(roots.changed_parent.iter());
+    let unparented: Vec<Entity> = roots.removed_parent.read().collect();
+    changed_nodes.extend(unparented);
+    changed_nodes.extend(roots.changed_geometry.iter());
+    #[cfg(feature = "ghost_nodes")]
+    changed_nodes.extend(ui_surface.dirty_ghost_children_scratch.iter().copied());
 
+    let mut memo = EntityHashMap::default();
+    let dirty_roots: EntityHashSet = changed_nodes
+        .into_iter()
+        .filter(|entity| node_query.contains(*entity))
+        .map(|entity| roots.root_of(entity, &mut memo))
+        .collect();
+
+    // The ordinary roots first: an independent root is placed against its
+    // parent's final geometry, so its parent's tree goes before it.
+    let mut pending_independent: Vec<Entity> = dirty_roots
+        .iter()
+        .copied()
+        .filter(|root| roots.independent.contains(*root) && roots.parent_of(*root).is_some())
+        .collect();
+    for ui_root_entity in ui_root_node_query.iter() {
+        if !dirty_roots.contains(&ui_root_entity) {
+            continue;
+        }
         update_children_recursively(
             &mut ui_surface,
             &ui_children,
             &added_node_query,
+            &roots,
+            &resync_children_of,
             ui_root_entity,
         );
 
@@ -211,7 +363,152 @@ pub fn ui_layout_system(
             computed_target.scale_factor.recip(),
             Vec2::ZERO,
             Vec2::ZERO,
+            &roots,
+            &mut pending_independent,
         );
+    }
+
+    // Then the independent roots, shallowest first, each dirty one laid out
+    // and each one whose parent moved (or was hidden or shown) placed again.
+    // Placing one can surface independent roots nested inside it, which are
+    // deeper and so come after it.
+    let mut done = EntityHashSet::default();
+    while !pending_independent.is_empty() {
+        pending_independent.sort_by_key(|entity| core::cmp::Reverse(roots.depth(*entity)));
+        pending_independent.dedup();
+        let Some(root) = pending_independent.pop() else {
+            break;
+        };
+        if !done.insert(root) {
+            continue;
+        }
+        let Some(parent) = roots.parent_of(root) else {
+            continue;
+        };
+        let Ok((parent_node, _, parent_transform, ..)) = node_update_query.get(parent) else {
+            continue;
+        };
+        let placement = IndependentPlacement {
+            parent_transform: **parent_transform,
+            parent_size: parent_node.size,
+            parent_scroll: parent_node.scroll_position,
+            hidden: roots.ancestor_hidden(root),
+        };
+        let dirty = dirty_roots.contains(&root);
+        if !dirty && placed.get(&root) == Some(&placement) {
+            continue;
+        }
+        placed.insert(root, placement);
+
+        if placement.hidden {
+            collapse_subtree(root, &mut node_update_query, &ui_children);
+            continue;
+        }
+
+        let Ok((_, _, _, computed_target)) = node_query.get(root) else {
+            continue;
+        };
+        let physical_size = computed_target.physical_size;
+        let scale_factor = computed_target.scale_factor;
+        if dirty {
+            update_children_recursively(
+                &mut ui_surface,
+                &ui_children,
+                &added_node_query,
+                &roots,
+                &resync_children_of,
+                root,
+            );
+            ui_surface.compute_layout(root, physical_size, &mut buffer_query, &mut font_system);
+        }
+        update_uinode_geometry_recursive(
+            root,
+            &mut ui_surface,
+            true,
+            physical_size.as_vec2(),
+            placement.parent_transform,
+            &mut node_update_query,
+            &ui_children,
+            scale_factor.recip(),
+            placement.parent_size,
+            placement.parent_scroll,
+            &roots,
+            &mut pending_independent,
+        );
+    }
+
+    /// Sync the taffy children of every node in `entity`'s layout tree that
+    /// needs it, leaving [`IndependentLayout`] children (and their subtrees)
+    /// out: they are layout roots of their own.
+    fn update_children_recursively(
+        ui_surface: &mut UiSurface,
+        ui_children: &UiChildren,
+        added_node_query: &Query<(), Added<Node>>,
+        roots: &LayoutRoots,
+        resync_children_of: &EntityHashSet,
+        entity: Entity,
+    ) {
+        let children_changed = ui_children.is_changed(entity)
+            || resync_children_of.contains(&entity)
+            || ui_children
+                .iter_ui_children(entity)
+                .any(|child| added_node_query.contains(child));
+        #[cfg(feature = "ghost_nodes")]
+        let children_changed =
+            children_changed || ui_surface.dirty_ghost_children_scratch.contains(&entity);
+
+        if ui_surface.entity_to_taffy.contains_key(&entity)
+            && (added_node_query.contains(entity) || children_changed)
+        {
+            ui_surface.update_children(
+                entity,
+                ui_children
+                    .iter_ui_children(entity)
+                    .filter(|child| !roots.independent.contains(*child)),
+            );
+        }
+
+        for child in ui_children.iter_ui_children(entity) {
+            if roots.independent.contains(child) {
+                continue;
+            }
+            update_children_recursively(
+                ui_surface,
+                ui_children,
+                added_node_query,
+                roots,
+                resync_children_of,
+                child,
+            );
+        }
+    }
+
+    /// Give every node in `entity`'s subtree a zero size: the subtree of an
+    /// [`IndependentLayout`] root under a hidden ancestor, which as a layout
+    /// child would have been laid out at nothing.
+    fn collapse_subtree(
+        entity: Entity,
+        node_update_query: &mut Query<(
+            &mut ComputedNode,
+            &UiTransform,
+            &mut UiGlobalTransform,
+            &Node,
+            Option<&LayoutConfig>,
+            Option<&Outline>,
+            Option<&ScrollPosition>,
+            Option<&IgnoreScroll>,
+        )>,
+        ui_children: &UiChildren,
+    ) {
+        if let Ok((mut node, ..)) = node_update_query.get_mut(entity)
+            && (node.size != Vec2::ZERO || node.unrounded_size != Vec2::ZERO)
+        {
+            node.size = Vec2::ZERO;
+            node.unrounded_size = Vec2::ZERO;
+        }
+        for child in ui_children.iter_ui_children(entity) {
+            collapse_subtree(child, node_update_query, ui_children);
+        }
     }
 
     // Returns the combined bounding box of the node and any of its overflowing children.
@@ -235,6 +532,8 @@ pub fn ui_layout_system(
         inverse_target_scale_factor: f32,
         parent_size: Vec2,
         parent_scroll_position: Vec2,
+        roots: &LayoutRoots,
+        independent_children: &mut Vec<Entity>,
     ) {
         if let Ok((
             mut node,
@@ -369,6 +668,12 @@ pub fn ui_layout_system(
             node.bypass_change_detection().scroll_position = physical_scroll_position;
 
             for child_uinode in ui_children.iter_ui_children(entity) {
+                // An independent child is its own layout root, placed after
+                // this tree against this node's final geometry.
+                if roots.independent.contains(child_uinode) {
+                    independent_children.push(child_uinode);
+                    continue;
+                }
                 update_uinode_geometry_recursive(
                     child_uinode,
                     ui_surface,
@@ -380,6 +685,8 @@ pub fn ui_layout_system(
                     inverse_target_scale_factor,
                     layout_size,
                     physical_scroll_position,
+                    roots,
+                    independent_children,
                 );
             }
         }
@@ -1380,6 +1687,327 @@ mod tests {
             .resource_mut::<UiSurface>()
             .root_entity_to_viewport_node
             .contains_key(&ui_root_entity_1));
+    }
+
+    /// The laid-out size and the top-left corner (physical px) of a UI node.
+    fn size_and_corner(world: &mut World, entity: Entity) -> (Vec2, Vec2) {
+        let node = world.get::<ComputedNode>(entity).unwrap();
+        let transform = world.get::<UiGlobalTransform>(entity).unwrap();
+        (node.size, transform.translation - 0.5 * node.size)
+    }
+
+    /// A full-viewport root holding, in a row, an independent node absolutely
+    /// placed at (30, 20) and a 50 px wide sibling. Returns (root, independent,
+    /// sibling).
+    fn spawn_independent_fixture(world: &mut World) -> (Entity, Entity, Entity) {
+        let root = world
+            .spawn(Node {
+                width: Val::Percent(100.),
+                height: Val::Percent(100.),
+                ..default()
+            })
+            .id();
+        let independent = world
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(30.),
+                    top: Val::Px(20.),
+                    width: Val::Px(100.),
+                    height: Val::Px(40.),
+                    ..default()
+                },
+                IndependentLayout,
+                ChildOf(root),
+            ))
+            .id();
+        let sibling = world
+            .spawn((
+                Node {
+                    width: Val::Px(50.),
+                    height: Val::Px(10.),
+                    ..default()
+                },
+                ChildOf(root),
+            ))
+            .id();
+        (root, independent, sibling)
+    }
+
+    #[test]
+    fn an_independent_node_is_placed_relative_to_its_parent_and_takes_no_space() {
+        let mut app = setup_ui_test_app();
+        let world = app.world_mut();
+        let (_root, independent, sibling) = spawn_independent_fixture(world);
+        // A non-absolute independent node would have taken the row's first
+        // 200 px; it must not.
+        let flowing = world
+            .spawn((
+                Node {
+                    width: Val::Px(200.),
+                    height: Val::Px(10.),
+                    ..default()
+                },
+                IndependentLayout,
+                ChildOf(_root),
+            ))
+            .id();
+        app.update();
+        let world = app.world_mut();
+
+        let (size, corner) = size_and_corner(world, independent);
+        assert_eq!(size, Vec2::new(100., 40.));
+        assert_eq!(corner, Vec2::new(30., 20.));
+        let (_, sibling_corner) = size_and_corner(world, sibling);
+        assert_eq!(
+            sibling_corner,
+            Vec2::ZERO,
+            "the sibling is first in the row"
+        );
+        let (flowing_size, flowing_corner) = size_and_corner(world, flowing);
+        assert_eq!(flowing_size, Vec2::new(200., 10.));
+        assert_eq!(flowing_corner, Vec2::ZERO);
+    }
+
+    #[test]
+    fn a_change_inside_an_independent_node_leaves_its_parents_tree_alone() {
+        let mut app = setup_ui_test_app();
+        let world = app.world_mut();
+        let (_root, independent, sibling) = spawn_independent_fixture(world);
+        let inner = world
+            .spawn((
+                Node {
+                    width: Val::Px(10.),
+                    height: Val::Px(10.),
+                    ..default()
+                },
+                ChildOf(independent),
+            ))
+            .id();
+        app.update();
+        let (_, before) = size_and_corner(app.world_mut(), sibling);
+
+        // An offset on the sibling that change detection is not told about: a
+        // pass over the root's tree would apply it, so the sibling staying put
+        // is the root's tree not having been walked.
+        let world = app.world_mut();
+        world
+            .get_mut::<UiTransform>(sibling)
+            .unwrap()
+            .bypass_change_detection()
+            .translation = Val2::px(7., 0.);
+        world.get_mut::<Node>(inner).unwrap().width = Val::Px(20.);
+        app.update();
+        let world = app.world_mut();
+
+        let (inner_size, _) = size_and_corner(world, inner);
+        assert_eq!(inner_size.x, 20., "the independent node was laid out");
+        let (_, after) = size_and_corner(world, sibling);
+        assert_eq!(
+            after, before,
+            "a change inside an independent node must not walk its parent's tree"
+        );
+
+        // With teeth: a change in the root's own tree does walk it, and the
+        // planted offset then shows.
+        app.world_mut().get_mut::<Node>(sibling).unwrap().height = Val::Px(11.);
+        app.update();
+        let (_, walked) = size_and_corner(app.world_mut(), sibling);
+        assert_eq!(walked, before + Vec2::new(7., 0.));
+    }
+
+    #[test]
+    fn an_independent_node_under_a_hidden_ancestor_is_collapsed_and_restored() {
+        let mut app = setup_ui_test_app();
+        let world = app.world_mut();
+        let root = world
+            .spawn(Node {
+                width: Val::Percent(100.),
+                height: Val::Percent(100.),
+                ..default()
+            })
+            .id();
+        let container = world
+            .spawn((
+                Node {
+                    width: Val::Px(300.),
+                    height: Val::Px(60.),
+                    ..default()
+                },
+                ChildOf(root),
+            ))
+            .id();
+        let independent = world
+            .spawn((
+                Node {
+                    width: Val::Px(100.),
+                    height: Val::Px(40.),
+                    ..default()
+                },
+                IndependentLayout,
+                ChildOf(container),
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            size_and_corner(app.world_mut(), independent).0,
+            Vec2::new(100., 40.)
+        );
+
+        app.world_mut().get_mut::<Node>(container).unwrap().display = Display::None;
+        app.update();
+        assert_eq!(size_and_corner(app.world_mut(), independent).0, Vec2::ZERO);
+
+        app.world_mut().get_mut::<Node>(container).unwrap().display = Display::Flex;
+        app.update();
+        assert_eq!(
+            size_and_corner(app.world_mut(), independent).0,
+            Vec2::new(100., 40.)
+        );
+    }
+
+    #[test]
+    fn removing_independence_rejoins_the_parents_layout() {
+        let mut app = setup_ui_test_app();
+        let world = app.world_mut();
+        let root = world
+            .spawn(Node {
+                width: Val::Percent(100.),
+                height: Val::Percent(100.),
+                ..default()
+            })
+            .id();
+        let first = world
+            .spawn((
+                Node {
+                    width: Val::Px(200.),
+                    height: Val::Px(10.),
+                    ..default()
+                },
+                IndependentLayout,
+                ChildOf(root),
+            ))
+            .id();
+        let second = world
+            .spawn((
+                Node {
+                    width: Val::Px(50.),
+                    height: Val::Px(10.),
+                    ..default()
+                },
+                ChildOf(root),
+            ))
+            .id();
+        app.update();
+        assert_eq!(size_and_corner(app.world_mut(), second).1, Vec2::ZERO);
+
+        app.world_mut()
+            .entity_mut(first)
+            .remove::<IndependentLayout>();
+        app.update();
+        assert_eq!(
+            size_and_corner(app.world_mut(), second).1,
+            Vec2::new(200., 0.),
+            "the formerly independent node takes its place in the row again"
+        );
+
+        app.world_mut().entity_mut(first).insert(IndependentLayout);
+        app.update();
+        assert_eq!(size_and_corner(app.world_mut(), second).1, Vec2::ZERO);
+    }
+
+    #[test]
+    fn an_independent_node_follows_its_parent() {
+        let mut app = setup_ui_test_app();
+        let world = app.world_mut();
+        let root = world
+            .spawn(Node {
+                width: Val::Percent(100.),
+                height: Val::Percent(100.),
+                ..default()
+            })
+            .id();
+        let parent = world
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(100.),
+                    top: Val::Px(10.),
+                    width: Val::Px(300.),
+                    height: Val::Px(60.),
+                    ..default()
+                },
+                ChildOf(root),
+            ))
+            .id();
+        let independent = world
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(5.),
+                    top: Val::Px(5.),
+                    width: Val::Px(20.),
+                    height: Val::Px(20.),
+                    ..default()
+                },
+                IndependentLayout,
+                ChildOf(parent),
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            size_and_corner(app.world_mut(), independent).1,
+            Vec2::new(105., 15.)
+        );
+
+        app.world_mut().get_mut::<Node>(parent).unwrap().left = Val::Px(200.);
+        app.update();
+        assert_eq!(
+            size_and_corner(app.world_mut(), independent).1,
+            Vec2::new(205., 15.),
+            "an unchanged independent node is placed again when its parent moves"
+        );
+    }
+
+    #[test]
+    fn an_unparented_node_is_laid_out_as_a_root() {
+        let mut app = setup_ui_test_app();
+        let world = app.world_mut();
+        let root = world
+            .spawn(Node {
+                width: Val::Percent(100.),
+                height: Val::Percent(100.),
+                ..default()
+            })
+            .id();
+        let child = world
+            .spawn((
+                Node {
+                    width: Val::Percent(50.),
+                    height: Val::Px(10.),
+                    ..default()
+                },
+                ChildOf(root),
+            ))
+            .id();
+        app.update();
+
+        // Nothing about the child itself changes: only its parent goes.
+        app.world_mut().entity_mut(child).remove::<ChildOf>();
+        app.update();
+        let world = app.world_mut();
+        assert!(
+            world
+                .resource::<UiSurface>()
+                .root_entity_to_viewport_node
+                .contains_key(&child),
+            "an un-parented node becomes a layout root of its own"
+        );
+        assert_eq!(
+            size_and_corner(world, child).0.x,
+            TARGET_WIDTH as f32 / 2.,
+            "and is laid out against the viewport"
+        );
     }
 
     #[cfg(feature = "ghost_nodes")]
