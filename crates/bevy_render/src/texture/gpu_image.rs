@@ -8,8 +8,13 @@ use bevy_ecs::system::{lifetimeless::SRes, SystemParamItem};
 use bevy_image::{Image, ImageSampler};
 use bevy_log::warn;
 use bevy_math::{AspectRatio, UVec2};
-use wgpu::{Extent3d, TexelCopyBufferLayout, TextureFormat, TextureUsages};
-use wgpu_types::{TextureDescriptor, TextureViewDescriptor};
+use wgpu::{
+    Extent3d, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureFormat, TextureUsages,
+};
+use wgpu_types::{
+    Origin3d, TextureAspect, TextureDataOrder, TextureDescriptor, TextureDimension,
+    TextureViewDescriptor,
+};
 
 /// The GPU-representation of an [`Image`].
 /// Consists of the [`Texture`], its [`TextureView`] and the corresponding [`Sampler`], and the texture's size.
@@ -77,19 +82,18 @@ impl RenderAsset for GpuImage {
             && let Some(block_bytes) = image.texture_descriptor.format.block_copy_size(None)
         {
             if let Some(ref data) = image.data {
-                let (block_width, block_height) =
-                    image.texture_descriptor.format.block_dimensions();
-
-                // queue copy
-                render_queue.write_texture(
-                    prev.texture.as_image_copy(),
+                // queue copy of every mip level of every layer, not just the
+                // first level: `data` holds the whole chain, laid out as
+                // `data_order` says, exactly as `create_texture_with_data`
+                // reads it below — so an image with mips that is replaced by
+                // one of the same size does not keep its old lower levels.
+                write_texture_data(
+                    render_queue,
+                    &prev.texture,
+                    &image.texture_descriptor,
+                    image.data_order,
+                    block_bytes,
                     data,
-                    TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(image.width() / block_width * block_bytes),
-                        rows_per_image: Some(image.height() / block_height),
-                    },
-                    image.texture_descriptor.size,
                 );
             }
 
@@ -210,5 +214,74 @@ impl GpuImage {
             .as_ref()
             .and_then(|view_desc| view_desc.format)
             .unwrap_or(self.texture_descriptor.format)
+    }
+}
+
+/// Write `data` — every mip level of every layer of a texture described by
+/// `descriptor`, in `order` — into the existing `texture`.
+///
+/// The same traversal as `wgpu`'s `DeviceExt::create_texture_with_data`, which is
+/// how the same bytes reach a texture that is created rather than reused; the two
+/// paths must agree on the layout or a reused texture reads garbage.
+fn write_texture_data(
+    queue: &RenderQueue,
+    texture: &Texture,
+    descriptor: &TextureDescriptor<Option<&'static str>, &'static [TextureFormat]>,
+    order: TextureDataOrder,
+    block_bytes: u32,
+    data: &[u8],
+) {
+    let (block_width, block_height) = descriptor.format.block_dimensions();
+    let layers = descriptor.array_layer_count();
+    let (outer_count, inner_count) = match order {
+        TextureDataOrder::LayerMajor => (layers, descriptor.mip_level_count),
+        TextureDataOrder::MipMajor => (descriptor.mip_level_count, layers),
+    };
+    let mut offset = 0;
+    for outer in 0..outer_count {
+        for inner in 0..inner_count {
+            let (layer, mip) = match order {
+                TextureDataOrder::LayerMajor => (outer, inner),
+                TextureDataOrder::MipMajor => (inner, outer),
+            };
+            let Some(mut mip_size) = descriptor.mip_level_size(mip) else {
+                return;
+            };
+            if descriptor.dimension != TextureDimension::D3 {
+                mip_size.depth_or_array_layers = 1;
+            }
+            let physical = mip_size.physical_size(descriptor.format);
+            let width_blocks = physical.width / block_width;
+            let height_blocks = physical.height / block_height;
+            let bytes_per_row = width_blocks * block_bytes;
+            let size = (bytes_per_row * height_blocks * mip_size.depth_or_array_layers) as usize;
+            let Some(level) = data.get(offset..offset + size) else {
+                warn!(
+                    "image data ends before mip level {mip} of layer {layer}; \
+                     the rest of the texture keeps its previous contents"
+                );
+                return;
+            };
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &**texture,
+                    mip_level: mip,
+                    origin: Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer,
+                    },
+                    aspect: TextureAspect::All,
+                },
+                level,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height_blocks),
+                },
+                physical,
+            );
+            offset += size;
+        }
     }
 }
