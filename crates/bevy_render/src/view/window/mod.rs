@@ -1,7 +1,7 @@
 use crate::camera::extract_cameras;
 use crate::renderer::WgpuWrapper;
 use crate::{
-    render_resource::{SurfaceTexture, TextureView},
+    render_resource::{SurfaceTexture, Texture, TextureView},
     renderer::{RenderAdapter, RenderDevice, RenderInstance},
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
 };
@@ -11,15 +11,21 @@ use bevy_ecs::{entity::EntityHashMap, prelude::*};
 use bevy_log::{debug, info, warn};
 use bevy_utils::default;
 use bevy_window::{
-    CompositeAlphaMode, PresentMode, PrimaryWindow, RawHandleWrapper, Window, WindowClosing,
+    CompositeAlphaMode, OffscreenWindow, PresentMode, PrimaryWindow, RawHandleWrapper, Window,
+    WindowClosing,
 };
 use core::{
     num::NonZero,
     ops::{Deref, DerefMut},
 };
 use wgpu::{
-    SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages, TextureViewDescriptor,
+    Extent3d, SurfaceConfiguration, SurfaceTargetUnsafe, TextureDescriptor, TextureDimension,
+    TextureFormat, TextureUsages, TextureViewDescriptor,
 };
+
+/// The format of an [`OffscreenWindow`]'s texture — the one a surface is asked
+/// for first, so a frame rendered off-screen is the frame a window would show.
+pub const OFFSCREEN_WINDOW_FORMAT: TextureFormat = TextureFormat::Rgba8UnormSrgb;
 
 pub mod screenshot;
 
@@ -50,7 +56,13 @@ impl Plugin for WindowRenderPlugin {
 pub struct ExtractedWindow {
     /// An entity that contains the components in [`Window`].
     pub entity: Entity,
-    pub handle: RawHandleWrapper,
+    /// The OS window's handle, or `None` for an [`OffscreenWindow`], which has
+    /// no surface and renders into [`ExtractedWindow::offscreen_texture`].
+    pub handle: Option<RawHandleWrapper>,
+    /// An [`OffscreenWindow`]'s stand-in for a swap chain: a texture of the
+    /// window's physical size that stays alive across frames (nothing presents
+    /// it), and that a screenshot of the window reads back.
+    pub offscreen_texture: Option<Texture>,
     pub physical_width: u32,
     pub physical_height: u32,
     pub present_mode: PresentMode,
@@ -85,6 +97,48 @@ impl ExtractedWindow {
             frame.texture.create_view(&texture_view_descriptor),
         ));
         self.swap_chain_texture = Some(SurfaceTexture::from(frame));
+    }
+
+    /// Whether this window renders into an off-screen texture rather than a
+    /// surface (an [`OffscreenWindow`]).
+    pub fn is_offscreen(&self) -> bool {
+        self.handle.is_none()
+    }
+
+    /// Point the "swap chain" view at this off-screen window's texture,
+    /// (re)creating the texture at the window's physical size first when it is
+    /// missing or the window was resized.
+    fn prepare_offscreen_texture(&mut self, render_device: &RenderDevice) {
+        let size = Extent3d {
+            width: self.physical_width,
+            height: self.physical_height,
+            depth_or_array_layers: 1,
+        };
+        if self.size_changed
+            || self
+                .offscreen_texture
+                .as_ref()
+                .is_none_or(|texture| texture.size() != size)
+        {
+            self.offscreen_texture = Some(render_device.create_texture(&TextureDescriptor {
+                label: Some("offscreen_window_texture"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: OFFSCREEN_WINDOW_FORMAT,
+                // Rendered to like a swap chain, and also read back (a
+                // screenshot) and sampled (a preview of it on a real window).
+                usage: TextureUsages::RENDER_ATTACHMENT
+                    | TextureUsages::COPY_SRC
+                    | TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }));
+        }
+        if let Some(texture) = &self.offscreen_texture {
+            self.swap_chain_texture_view =
+                Some(texture.create_view(&TextureViewDescriptor::default()));
+        }
     }
 
     fn has_swapchain_texture(&self) -> bool {
@@ -125,11 +179,28 @@ impl DerefMut for ExtractedWindows {
 fn extract_windows(
     mut extracted_windows: ResMut<ExtractedWindows>,
     mut closing: Extract<MessageReader<WindowClosing>>,
-    windows: Extract<Query<(Entity, &Window, &RawHandleWrapper, Option<&PrimaryWindow>)>>,
+    windows: Extract<
+        Query<(
+            Entity,
+            &Window,
+            Option<&RawHandleWrapper>,
+            Has<OffscreenWindow>,
+            Option<&PrimaryWindow>,
+        )>,
+    >,
     mut removed: Extract<RemovedComponents<RawHandleWrapper>>,
+    mut removed_offscreen: Extract<RemovedComponents<OffscreenWindow>>,
     mut window_surfaces: ResMut<WindowSurfaces>,
 ) {
-    for (entity, window, handle, primary) in windows.iter() {
+    for (entity, window, handle, offscreen, primary) in windows.iter() {
+        // A window is rendered to once it has a surface, or when it never will
+        // and renders off-screen instead. One with neither is a platform window
+        // the backend has not created yet.
+        let handle = match (handle, offscreen) {
+            (_, true) => None,
+            (Some(handle), false) => Some(handle.clone()),
+            (None, false) => continue,
+        };
         if primary.is_some() {
             extracted_windows.primary = Some(entity);
         }
@@ -141,7 +212,12 @@ fn extract_windows(
 
         let extracted_window = extracted_windows.entry(entity).or_insert(ExtractedWindow {
             entity,
-            handle: handle.clone(),
+            // Off-screen, the format is known before any texture exists, so a
+            // screenshot or a camera preparing this frame can already ask it.
+            swap_chain_texture_format: handle.is_none().then_some(OFFSCREEN_WINDOW_FORMAT),
+            swap_chain_texture_view_format: handle.is_none().then_some(OFFSCREEN_WINDOW_FORMAT),
+            handle,
+            offscreen_texture: None,
             physical_width: new_width,
             physical_height: new_height,
             present_mode: window.present_mode,
@@ -149,8 +225,6 @@ fn extract_windows(
             swap_chain_texture: None,
             swap_chain_texture_view: None,
             size_changed: false,
-            swap_chain_texture_format: None,
-            swap_chain_texture_view_format: None,
             present_mode_changed: false,
             alpha_mode: window.composite_alpha_mode,
             needs_initial_present: true,
@@ -193,7 +267,7 @@ fn extract_windows(
         extracted_windows.remove(&closing_window.window);
         window_surfaces.remove(&closing_window.window);
     }
-    for removed_window in removed.read() {
+    for removed_window in removed.read().chain(removed_offscreen.read()) {
         extracted_windows.remove(&removed_window);
         window_surfaces.remove(&removed_window);
     }
@@ -249,6 +323,13 @@ pub fn prepare_windows(
     #[cfg(target_os = "linux")] render_instance: Res<RenderInstance>,
 ) {
     for window in windows.windows.values_mut() {
+        // An off-screen window has no surface to acquire from: its texture is
+        // the swap chain, kept across frames and never presented.
+        if window.is_offscreen() {
+            window.prepare_offscreen_texture(&render_device);
+            continue;
+        }
+
         // Skip acquiring a swap-chain texture for windows that no camera
         // targets. This avoids a wasted clear pass in
         // `handle_uncovered_swap_chains` that triggers a DMA-fence fd leak on
@@ -342,6 +423,9 @@ pub fn need_surface_configuration(
     window_surfaces: Res<WindowSurfaces>,
 ) -> bool {
     for window in windows.windows.values() {
+        if window.is_offscreen() {
+            continue;
+        }
         if !window_surfaces.configured_windows.contains(&window.entity)
             || window.size_changed
             || window.present_mode_changed
@@ -370,13 +454,17 @@ pub fn create_surfaces(
     render_device: Res<RenderDevice>,
 ) {
     for window in windows.windows.values_mut() {
+        let Some(handle) = window.handle.clone() else {
+            // Off-screen: nothing to create a surface on.
+            continue;
+        };
         let data = window_surfaces
             .surfaces
             .entry(window.entity)
             .or_insert_with(|| {
                 let surface_target = SurfaceTargetUnsafe::RawHandle {
-                    raw_display_handle: Some(window.handle.get_display_handle()),
-                    raw_window_handle: window.handle.get_window_handle(),
+                    raw_display_handle: Some(handle.get_display_handle()),
+                    raw_window_handle: handle.get_window_handle(),
                 };
                 // SAFETY: The window handles in ExtractedWindows will always be valid objects to create surfaces on
                 let surface = unsafe {

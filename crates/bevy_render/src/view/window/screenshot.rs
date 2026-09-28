@@ -267,6 +267,7 @@ fn prepare_screenshots(
     targets: Res<RenderScreenshotTargets>,
     mut prepared: ResMut<RenderScreenshotsPrepared>,
     window_surfaces: Res<WindowSurfaces>,
+    windows: Res<ExtractedWindows>,
     render_device: Res<RenderDevice>,
     screenshot_pipeline: Res<ScreenshotToScreenPipeline>,
     pipeline_cache: Res<PipelineCache>,
@@ -280,18 +281,36 @@ fn prepare_screenshots(
         match target {
             NormalizedRenderTarget::Window(window) => {
                 let window = window.entity();
-                let Some(surface_data) = window_surfaces.surfaces.get(&window) else {
-                    warn!("Unknown window for screenshot, skipping: {}", window);
-                    continue;
-                };
-                let view_format = surface_data
-                    .texture_view_format
-                    .unwrap_or(surface_data.configuration.format);
-                let size = Extent3d {
-                    width: surface_data.configuration.width,
-                    height: surface_data.configuration.height,
-                    ..default()
-                };
+                let (view_format, size) =
+                    if let Some(surface_data) = window_surfaces.surfaces.get(&window) {
+                        (
+                            surface_data
+                                .texture_view_format
+                                .unwrap_or(surface_data.configuration.format),
+                            Extent3d {
+                                width: surface_data.configuration.width,
+                                height: surface_data.configuration.height,
+                                ..default()
+                            },
+                        )
+                    } else if let Some(offscreen) = windows
+                        .get(&window)
+                        .filter(|extracted| extracted.is_offscreen())
+                    {
+                        // No surface: the window renders into its off-screen
+                        // texture, whose size and format the extract fixed.
+                        (
+                            super::OFFSCREEN_WINDOW_FORMAT,
+                            Extent3d {
+                                width: offscreen.physical_width,
+                                height: offscreen.physical_height,
+                                ..default()
+                            },
+                        )
+                    } else {
+                        warn!("Unknown window for screenshot, skipping: {}", window);
+                        continue;
+                    };
                 let (texture_view, state) = prepare_screenshot_state(
                     size,
                     view_format,

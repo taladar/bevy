@@ -55,6 +55,31 @@ static DEFAULT_WINDOW_TITLE: LazyLock<String> = LazyLock::new(|| {
 )]
 pub struct PrimaryWindow;
 
+/// Marker [`Component`] for a [`Window`] that has no OS window behind it and is
+/// rendered **off-screen** instead.
+///
+/// The windowing backend (`bevy_winit`) never creates a platform window for an
+/// entity carrying this, and the renderer gives it an off-screen texture of the
+/// window's physical resolution in place of a swap chain. Everything else sees
+/// an ordinary window: cameras target it through [`WindowRef`], picking hits the
+/// cameras rendering to it, [`Window::cursor_position`] answers whatever the
+/// app set, and a screenshot of it reads the texture back.
+///
+/// This is what lets an app render *and* pick with no display at all — an
+/// automated test, say — without retargeting every camera at an image (which
+/// the window's pointer then never hits) or reworking every reader of the
+/// window's cursor.
+///
+/// The window's size is exactly [`Window::resolution`]: nothing resizes it but
+/// the app.
+#[derive(Default, Debug, Component, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    derive(Reflect),
+    reflect(Component, Debug, Default, PartialEq, Clone)
+)]
+pub struct OffscreenWindow;
+
 /// Reference to a [`Window`], whether it be a direct link to a specific entity or
 /// a more vague defaulting choice.
 #[repr(C)]

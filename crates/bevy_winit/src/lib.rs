@@ -16,7 +16,7 @@ extern crate alloc;
 
 use bevy_derive::Deref;
 use bevy_reflect::Reflect;
-use bevy_window::{ExitSystems, RawHandleWrapperHolder, WindowEvent};
+use bevy_window::{ExitSystems, OffscreenWindow, RawHandleWrapperHolder, WindowEvent};
 use core::cell::RefCell;
 use winit::{event_loop::EventLoop, window::WindowId};
 
@@ -236,7 +236,7 @@ pub type CreateWindowParams<'w, 's> = (
             &'static CursorOptions,
             Option<&'static RawHandleWrapperHolder>,
         ),
-        Added<Window>,
+        (Added<Window>, Without<OffscreenWindow>),
     >,
     MessageWriter<'w, WindowCreated>,
     ResMut<'w, WinitActionRequestHandlers>,
