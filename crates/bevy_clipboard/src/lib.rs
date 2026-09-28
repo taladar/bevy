@@ -191,6 +191,13 @@ fn try_imagedata_from_image(image: &Image) -> Result<arboard::ImageData<'_>, Cli
 pub struct Clipboard {
     #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
     system_clipboard: Option<arboard::Clipboard>,
+    /// The private buffer of a clipboard built by [`Clipboard::in_process`],
+    /// which then never opens the system clipboard; `None` for the system one.
+    #[cfg(any(
+        all(any(windows, unix), feature = "system_clipboard"),
+        target_arch = "wasm32"
+    ))]
+    in_process: Option<String>,
     // Unfortunately, this cannot be simplified to `not(any(feature = "system_clipboard", target_arch = "wasm32"))`.
     // `system_clipboard` is a platform-conditional dependency (windows/unix only), so on other platforms
     // (Android, iOS, etc.) `cfg(feature = "system_clipboard")` can be true even though the crate is not
@@ -216,6 +223,11 @@ impl Default for Clipboard {
         Self {
             #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
             system_clipboard: arboard::Clipboard::new().ok(),
+            #[cfg(any(
+                all(any(windows, unix), feature = "system_clipboard"),
+                target_arch = "wasm32"
+            ))]
+            in_process: None,
             #[cfg(not(any(
                 all(any(windows, unix), feature = "system_clipboard"),
                 target_arch = "wasm32"
@@ -226,10 +238,44 @@ impl Default for Clipboard {
 }
 
 impl Clipboard {
+    /// A clipboard private to this app: text is copied into and pasted from an
+    /// in-process buffer, whatever the platform and features, and the system
+    /// clipboard is never opened — so nothing is read from or written to the
+    /// one the user copies and pastes with.
+    ///
+    /// For an app that must not touch the desktop it runs on, such as an
+    /// automated test driving several instances of an app in one process:
+    /// each gets its own clipboard, and a copy in one is what a paste in that
+    /// same one reads back. Images are not supported.
+    pub fn in_process() -> Self {
+        Self {
+            #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
+            system_clipboard: None,
+            #[cfg(any(
+                all(any(windows, unix), feature = "system_clipboard"),
+                target_arch = "wasm32"
+            ))]
+            in_process: Some(String::new()),
+            #[cfg(not(any(
+                all(any(windows, unix), feature = "system_clipboard"),
+                target_arch = "wasm32"
+            )))]
+            text: String::new(),
+        }
+    }
+
     /// Fetches UTF-8 text from the clipboard and returns it via a `ClipboardRead`.
     ///
     /// On Windows and Unix `ClipboardRead`s are completed instantly, on wasm32 the result is fetched asynchronously.
     pub fn fetch_text(&mut self) -> ClipboardRead {
+        #[cfg(any(
+            all(any(windows, unix), feature = "system_clipboard"),
+            target_arch = "wasm32"
+        ))]
+        if let Some(text) = &self.in_process {
+            return ClipboardRead::Ready(Ok(text.clone()));
+        }
+
         #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
         {
             ClipboardRead::Ready(
@@ -297,6 +343,15 @@ impl Clipboard {
     ///
     /// Returns error if `text` failed to be stored on the clipboard.
     pub fn set_text<'a, T: Into<Cow<'a, str>>>(&mut self, text: T) -> Result<(), ClipboardError> {
+        #[cfg(any(
+            all(any(windows, unix), feature = "system_clipboard"),
+            target_arch = "wasm32"
+        ))]
+        if let Some(buffer) = &mut self.in_process {
+            *buffer = text.into().into_owned();
+            return Ok(());
+        }
+
         #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
         {
             self.system_clipboard

@@ -80,6 +80,27 @@ pub struct PrimaryWindow;
 )]
 pub struct OffscreenWindow;
 
+/// Marker [`Component`] for a [`Window`] that is **shown but takes no input**:
+/// a window for a person to watch an app through, not to drive it with.
+///
+/// The windowing backend (`bevy_winit`) still creates, resizes, redraws and
+/// closes it, but drops every input event that arrives on it — keyboard, mouse
+/// buttons and wheel, cursor motion and enter/leave, touch, gestures, IME, file
+/// drops and focus changes — before the app sees any of them, and it stops
+/// forwarding device-level mouse motion (which names no window) while every
+/// platform window the app has is one of these.
+///
+/// Useful beside an [`OffscreenWindow`] whose frames are shown on this one: the
+/// app is driven by whatever writes its input (an automated test, say), and a
+/// person following along cannot move it by accident.
+#[derive(Default, Debug, Component, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    derive(Reflect),
+    reflect(Component, Debug, Default, PartialEq, Clone)
+)]
+pub struct ViewOnlyWindow;
+
 /// Reference to a [`Window`], whether it be a direct link to a specific entity or
 /// a more vague defaulting choice.
 #[repr(C)]

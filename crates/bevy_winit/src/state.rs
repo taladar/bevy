@@ -30,7 +30,7 @@ use winit::{
 
 use bevy_window::{
     AppLifecycle, CursorEntered, CursorLeft, CursorMoved, FileDragAndDrop, Ime, RequestRedraw,
-    Window, WindowBackendScaleFactorChanged, WindowCloseRequested, WindowDestroyed,
+    ViewOnlyWindow, Window, WindowBackendScaleFactorChanged, WindowCloseRequested, WindowDestroyed,
     WindowEvent as BevyWindowEvent, WindowFocused, WindowMoved, WindowOccluded, WindowResized,
     WindowScaleFactorChanged, WindowThemeChanged,
 };
@@ -87,6 +87,7 @@ pub(crate) struct WinitAppRunnerState {
                 &'static mut Window,
                 &'static mut CachedWindow,
                 &'static mut WinitWindowPressedKeys,
+                Has<ViewOnlyWindow>,
             ),
         >,
     >,
@@ -97,7 +98,12 @@ pub(crate) struct WinitAppRunnerState {
 impl WinitAppRunnerState {
     fn new(mut app: App) -> Self {
         let windows_system_state: SystemState<
-            Query<(&mut Window, &mut CachedWindow, &mut WinitWindowPressedKeys)>,
+            Query<(
+                &mut Window,
+                &mut CachedWindow,
+                &mut WinitWindowPressedKeys,
+                Has<ViewOnlyWindow>,
+            )>,
         > = SystemState::new(app.world_mut());
 
         Self {
@@ -223,12 +229,18 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
                     return;
                 };
 
-                let Ok((mut win, _, mut pressed_keys)) = windows.get_mut(window) else {
+                let Ok((mut win, _, mut pressed_keys, view_only)) = windows.get_mut(window) else {
                     warn!(
                         "Window {window:?} is missing `Window` component, skipping event {event:?}"
                     );
                     return;
                 };
+
+                // A view-only window is watched, not driven: its input never
+                // reaches the app, not even as a raw event.
+                if view_only && is_input_event(&event) {
+                    return;
+                }
 
                 // Store a copy of the event to send to a MessageWriter later.
                 self.raw_winit_events.push(RawWinitWindowEvent {
@@ -448,6 +460,18 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
         event: DeviceEvent,
     ) {
         self.device_event_received = true;
+
+        // Device motion names no window, so it is input to every window at once:
+        // drop it while every platform window is view-only.
+        let takes_input = self
+            .windows_system_state
+            .get_mut(self.app.world_mut())
+            .map_or(true, |windows| {
+                windows.iter().any(|(_, _, _, view_only)| !view_only)
+            });
+        if !takes_input {
+            return;
+        }
 
         if let DeviceEvent::MouseMotion { delta: (x, y) } = event {
             let delta = Vec2::new(x as f32, y as f32);
@@ -910,6 +934,34 @@ pub fn winit_runner(mut app: App, event_loop: EventLoop<WinitUserEvent>) -> AppE
             })
         }
     }
+}
+
+/// Whether `event` is input — something a person does *to* a window — rather
+/// than something that happens to it (a resize, a redraw, a close request). A
+/// [`ViewOnlyWindow`] drops the former.
+fn is_input_event(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::KeyboardInput { .. }
+            | WindowEvent::ModifiersChanged(_)
+            | WindowEvent::Ime(_)
+            | WindowEvent::CursorMoved { .. }
+            | WindowEvent::CursorEntered { .. }
+            | WindowEvent::CursorLeft { .. }
+            | WindowEvent::MouseWheel { .. }
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::PinchGesture { .. }
+            | WindowEvent::PanGesture { .. }
+            | WindowEvent::DoubleTapGesture { .. }
+            | WindowEvent::RotationGesture { .. }
+            | WindowEvent::TouchpadPressure { .. }
+            | WindowEvent::AxisMotion { .. }
+            | WindowEvent::Touch(_)
+            | WindowEvent::Focused(_)
+            | WindowEvent::DroppedFile(_)
+            | WindowEvent::HoveredFile(_)
+            | WindowEvent::HoveredFileCancelled
+    )
 }
 
 pub(crate) fn react_to_resize(
