@@ -16,6 +16,25 @@ use crate::{
     Task,
 };
 
+/// Wrap `future` so it runs in the tracing context of the code that spawned
+/// it: the subscriber that was the thread's default, and the span that was
+/// current, both at the moment of the spawn.
+///
+/// A task pool's threads are shared by everything in the process, so without
+/// this a task logs to the process's global subscriber with no span around it,
+/// whoever spawned it. With it, work spawned from inside a span (an app's
+/// update, a test's scoped subscriber) is still inside that span, and still
+/// reaches that subscriber, on whichever thread it runs — which is what makes
+/// the log lines of several apps in one process attributable to each. Nested
+/// spawns inherit transitively: a task spawned by a task runs in the context
+/// the first one carried.
+fn in_spawn_context<F: Future>(
+    future: F,
+) -> tracing::instrument::WithDispatch<tracing::instrument::Instrumented<F>> {
+    use tracing::instrument::{Instrument as _, WithSubscriber as _};
+    future.in_current_span().with_current_subscriber()
+}
+
 struct CallOnDrop(Option<Arc<dyn Fn() + Send + Sync + 'static>>);
 
 impl Drop for CallOnDrop {
@@ -560,7 +579,7 @@ impl TaskPool {
     where
         T: Send + 'static,
     {
-        self.executor.spawn(future)
+        self.executor.spawn(in_spawn_context(future))
     }
 
     /// Spawns a static future on the thread-local async executor for the
@@ -578,7 +597,7 @@ impl TaskPool {
     where
         T: 'static,
     {
-        TaskPool::LOCAL_EXECUTOR.with(|executor| executor.spawn(future))
+        TaskPool::LOCAL_EXECUTOR.with(|executor| executor.spawn(in_spawn_context(future)))
     }
 
     /// Runs a function with the local executor. Typically used to tick
@@ -646,7 +665,7 @@ impl<'scope, 'env, T: Send + 'scope> Scope<'scope, 'env, T> {
     pub fn spawn<Fut: Future<Output = T> + 'scope + Send>(&self, f: Fut) {
         let task = self
             .executor
-            .spawn(AssertUnwindSafe(f).catch_unwind())
+            .spawn(AssertUnwindSafe(in_spawn_context(f)).catch_unwind())
             .fallible();
         // ConcurrentQueue only errors when closed or full, but we never
         // close and use an unbounded queue, so it is safe to unwrap
@@ -662,7 +681,7 @@ impl<'scope, 'env, T: Send + 'scope> Scope<'scope, 'env, T> {
     pub fn spawn_on_scope<Fut: Future<Output = T> + 'scope + Send>(&self, f: Fut) {
         let task = self
             .scope_executor
-            .spawn(AssertUnwindSafe(f).catch_unwind())
+            .spawn(AssertUnwindSafe(in_spawn_context(f)).catch_unwind())
             .fallible();
         // ConcurrentQueue only errors when closed or full, but we never
         // close and use an unbounded queue, so it is safe to unwrap
@@ -679,7 +698,7 @@ impl<'scope, 'env, T: Send + 'scope> Scope<'scope, 'env, T> {
     pub fn spawn_on_external<Fut: Future<Output = T> + 'scope + Send>(&self, f: Fut) {
         let task = self
             .external_executor
-            .spawn(AssertUnwindSafe(f).catch_unwind())
+            .spawn(AssertUnwindSafe(in_spawn_context(f)).catch_unwind())
             .fallible();
         // ConcurrentQueue only errors when closed or full, but we never
         // close and use an unbounded queue, so it is safe to unwrap
@@ -705,6 +724,64 @@ mod tests {
     use super::*;
     use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::Barrier;
+
+    /// Counts the events it sees and records whether each was inside the span
+    /// named `tagged`.
+    #[derive(Default)]
+    struct CountingSubscriber {
+        events: std::sync::atomic::AtomicUsize,
+        tagged: std::sync::atomic::AtomicUsize,
+        next_id: std::sync::atomic::AtomicU64,
+        entered: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl tracing::Subscriber for CountingSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(self.next_id.fetch_add(1, Ordering::Relaxed) + 1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, _event: &tracing::Event<'_>) {
+            self.events.fetch_add(1, Ordering::Relaxed);
+            if !self.entered.lock().unwrap().is_empty() {
+                self.tagged.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, span: &tracing::span::Id) {
+            self.entered.lock().unwrap().push(span.into_u64());
+        }
+        fn exit(&self, _span: &tracing::span::Id) {
+            self.entered.lock().unwrap().pop();
+        }
+    }
+
+    #[test]
+    fn tasks_run_in_the_spawners_tracing_context() {
+        let pool = TaskPoolBuilder::new().num_threads(2).build();
+        let subscriber = Arc::new(CountingSubscriber::default());
+        let dispatch = tracing::Dispatch::from(subscriber.clone());
+        tracing::dispatcher::with_default(&dispatch, || {
+            let span = tracing::info_span!("tagged");
+            let _entered = span.enter();
+            pool.scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(async {
+                        tracing::info!("from a scoped task");
+                    });
+                }
+            });
+            block_on(pool.spawn(async {
+                tracing::info!("from a spawned task");
+            }));
+        });
+        // Every event reached the scoped subscriber, whichever pool thread
+        // ran it, and inside the span that was current at the spawn.
+        assert_eq!(subscriber.events.load(Ordering::Relaxed), 9);
+        assert_eq!(subscriber.tagged.load(Ordering::Relaxed), 9);
+    }
 
     #[test]
     fn test_spawn() {
