@@ -31,7 +31,7 @@ use bevy_material::{
 use bevy_platform::collections::HashSet;
 use bevy_reflect::Reflect;
 use bevy_shader::Shader;
-use bevy_tasks::AsyncComputeTaskPool;
+use bevy_tasks::{AsyncComputeTaskPool, Task};
 use bevy_utils::default;
 use bevy_window::{PrimaryWindow, WindowRef};
 use core::ops::Deref;
@@ -129,6 +129,29 @@ struct RenderScreenshotsPrepared(EntityHashMap<ScreenshotPreparedState>);
 
 #[derive(Resource, Deref, DerefMut)]
 struct RenderScreenshotsSender(Sender<(Entity, Image)>);
+
+/// The readback tasks [`collect_screenshots`] has started and that have not
+/// finished yet.
+///
+/// Each task holds a clone of its screenshot's readback [`Buffer`], and through
+/// it the render device. A detached task could therefore outlive the app that
+/// asked for the screenshot: finishing on a task-pool thread after the app was
+/// dropped — even after `main` returned — it would drop the last reference to
+/// the device while the process was exiting, and a Vulkan layer's exit handler
+/// tearing down the same device state crashes the process. So the tasks are
+/// owned by the render world, and dropping it cancels each one and waits until
+/// its future (and its buffer) is gone.
+#[derive(Resource, Default)]
+struct RenderScreenshotTasks(Vec<Task<()>>);
+
+impl Drop for RenderScreenshotTasks {
+    fn drop(&mut self) {
+        for task in self.0.drain(..) {
+            // Returns once the future has been dropped, wherever it was.
+            let _output = bevy_tasks::block_on(task.cancel());
+        }
+    }
+}
 
 /// Saves the captured screenshot to disk at the provided path.
 pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>) {
@@ -448,6 +471,7 @@ impl Plugin for ScreenshotPlugin {
             .insert_resource(RenderScreenshotsSender(tx))
             .init_resource::<RenderScreenshotTargets>()
             .init_resource::<RenderScreenshotsPrepared>()
+            .init_resource::<RenderScreenshotTasks>()
             .init_gpu_resource::<SpecializedRenderPipelines<ScreenshotToScreenPipeline>>()
             .add_systems(RenderStartup, init_screenshot_to_screen_pipeline)
             .add_systems(ExtractSchedule, extract_screenshots.ambiguous_with_all())
@@ -652,6 +676,7 @@ pub(crate) fn collect_screenshots(world: &mut World) {
     let _span = bevy_log::info_span!("collect_screenshots").entered();
 
     let sender = world.resource::<RenderScreenshotsSender>().deref().clone();
+    let mut started = Vec::new();
     let prepared = world.resource::<RenderScreenshotsPrepared>();
 
     for (entity, prepared) in prepared.iter() {
@@ -669,13 +694,25 @@ pub(crate) fn collect_screenshots(world: &mut World) {
             let (tx, rx) = async_channel::bounded(1);
             let buffer_slice = buffer.slice(..);
             // The polling for this map call is done every frame when the command queue is submitted.
+            // The callback hands its result to the task rather than panicking on an
+            // error: when the task is cancelled with the map still pending, dropping
+            // its buffer runs this callback with an error from inside that drop, and a
+            // panic there aborts the process. A cancelled task has no receiver left,
+            // so the result is dropped with it; a live one reports the failure.
             buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-                if let Err(err) = result {
-                    panic!("{}", err.to_string());
-                }
-                tx.try_send(()).unwrap();
+                let _ = tx.try_send(result);
             });
-            rx.recv().await.unwrap();
+            match rx.recv().await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    error!("Failed to map a screenshot buffer: {}", err);
+                    return;
+                }
+                Err(_closed) => {
+                    error!("A screenshot buffer's map callback was dropped without running");
+                    return;
+                }
+            }
             let data = buffer_slice.get_mapped_range();
             // we immediately move the data to CPU memory to avoid holding the mapped view for long
             let mut result = Vec::from(&*data);
@@ -716,6 +753,10 @@ pub(crate) fn collect_screenshots(world: &mut World) {
             }
         };
 
-        AsyncComputeTaskPool::get().spawn(finish).detach();
+        started.push(AsyncComputeTaskPool::get().spawn(finish));
     }
+
+    let mut tasks = world.resource_mut::<RenderScreenshotTasks>();
+    tasks.0.retain(|task| !task.is_finished());
+    tasks.0.extend(started);
 }
