@@ -216,6 +216,29 @@ pub struct PipelineCache {
     needs_shader_reload: bool,
 }
 
+/// Cancels every pipeline still compiling on a task-pool thread and waits until
+/// each compile has stopped.
+///
+/// A dropped `Task` does not stop a compile that is already running: it goes on
+/// inside the driver (`vkCreateShaderModule`, `vkCreateGraphicsPipelines`) on
+/// its worker thread. A process that returns from `main` right after dropping
+/// its app would then run the exit handlers — a Vulkan layer's among them,
+/// tearing down the state that compile is using — beside it, and crash. Waiting
+/// here means no compile outlives the cache that started it.
+impl Drop for PipelineCache {
+    fn drop(&mut self) {
+        for cached in &mut self.pipelines {
+            if matches!(cached.state, CachedPipelineState::Creating(_)) {
+                let state = mem::replace(&mut cached.state, CachedPipelineState::Queued);
+                if let CachedPipelineState::Creating(task) = state {
+                    // Returns once the compile has finished or been dropped.
+                    let _output = bevy_tasks::block_on(task.cancel());
+                }
+            }
+        }
+    }
+}
+
 impl PipelineCache {
     /// Returns an iterator over the pipelines in the pipeline cache.
     pub fn pipelines(&self) -> impl Iterator<Item = &CachedPipeline> {
