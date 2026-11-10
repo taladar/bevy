@@ -67,6 +67,21 @@ fn runs_right_to_left(is_vertical: bool, node: Option<&Node>) -> bool {
     !is_vertical && node.is_some_and(|node| node.direction == InlineDirection::Rtl)
 }
 
+/// The length of the slider's padding box along its axis, in physical pixels: the node's size less
+/// its border on both ends.
+///
+/// That box is the containing block an absolutely positioned thumb's insets (or a percentage
+/// offset) resolve against, so the thumb travels inside the border; measuring the border box
+/// instead put the value under the pointer one border width away from the thumb.
+fn track_length(node: &ComputedNode, is_vertical: bool) -> f32 {
+    let border = node.border();
+    if is_vertical {
+        node.size().y - border.min_inset.y - border.max_inset.y
+    } else {
+        node.size().x - border.min_inset.x - border.max_inset.x
+    }
+}
+
 /// Defines how the slider should behave when you click on the track (not the thumb).
 #[derive(Debug, Default, PartialEq, Clone, Copy, Reflect)]
 #[reflect(Clone, PartialEq, Default)]
@@ -107,6 +122,9 @@ pub enum TrackClick {
 /// left: the stylist is expected to place the thumb from the right edge (the inline start), and a
 /// track click, a drag and the arrow keys all follow that, so the value under the pointer is the
 /// one the thumb would be drawn at.
+///
+/// Positions are measured inside the slider's border (its padding box), which is where an
+/// absolutely positioned thumb is placed, so the travel is the width less the border and the thumb.
 #[derive(Component, Debug, Default, Clone)]
 #[require(
     AccessibilityNode(accesskit::Node::new(Role::Slider)),
@@ -339,27 +357,26 @@ pub(crate) fn slider_on_pointer_down(
         ) else {
             return;
         };
-        let track_size = if is_vertical {
-            node.size().y - thumb_size
-        } else {
-            node.size().x - thumb_size
-        };
+        let track_size = track_length(node, is_vertical) - thumb_size;
+        let border = node.border();
 
         // Avoid division by zero
         let click_val = if track_size > 0. {
             if is_vertical {
                 // For vertical sliders: bottom-to-top (0 at bottom, max at top)
-                // normalized_pos.y ranges from -0.5 (top) to +0.5 (bottom)
-                let y_from_bottom = (0.5 - normalized_pos.y) * node.size().y;
+                // normalized_pos.y ranges from -0.5 (top) to +0.5 (bottom); the origin is the
+                // inner edge of the bottom border.
+                let y_from_bottom = (0.5 - normalized_pos.y) * node.size().y - border.max_inset.y;
                 let adjusted_y = y_from_bottom - thumb_size / 2.0;
                 adjusted_y * range.span() / track_size + range.start()
             } else {
                 // For horizontal sliders: convert from center-origin to an origin at the start
-                // edge, the left one, or the right one when the slider runs right to left.
+                // edge, the left one, or the right one when the slider runs right to left, each
+                // measured from the inner edge of that side's border.
                 let x_from_start = if runs_right_to_left(is_vertical, layout) {
-                    (0.5 - normalized_pos.x) * node.size().x
+                    (0.5 - normalized_pos.x) * node.size().x - border.max_inset.x
                 } else {
-                    (normalized_pos.x + 0.5) * node.size().x
+                    (normalized_pos.x + 0.5) * node.size().x - border.min_inset.x
                 };
                 let adjusted_x = x_from_start - thumb_size / 2.0;
                 adjusted_x * range.span() / track_size + range.start()
@@ -549,11 +566,8 @@ fn emit_slider_drag_value_change(
         })
         .unwrap_or(0.0);
 
-    let slider_size = if is_vertical {
-        ((node.size().y - thumb_size) * node.inverse_scale_factor).max(1.0)
-    } else {
-        ((node.size().x - thumb_size) * node.inverse_scale_factor).max(1.0)
-    };
+    let slider_size =
+        ((track_length(node, is_vertical) - thumb_size) * node.inverse_scale_factor).max(1.0);
 
     let drag_distance = if is_vertical {
         distance.y
@@ -813,6 +827,21 @@ mod tests {
         assert!(!runs_right_to_left(true, Some(&rtl)));
         assert!(!runs_right_to_left(false, Some(&ltr)));
         assert!(!runs_right_to_left(false, None));
+    }
+
+    #[test]
+    fn the_track_is_measured_inside_its_border() {
+        let node = ComputedNode {
+            size: bevy_math::Vec2::new(100.0, 20.0),
+            border: bevy_ui::prelude::BorderRect {
+                min_inset: bevy_math::Vec2::new(2.0, 1.0),
+                max_inset: bevy_math::Vec2::new(3.0, 4.0),
+            },
+            padding: bevy_ui::prelude::BorderRect::all(5.0),
+            ..Default::default()
+        };
+        assert_eq!(track_length(&node, false), 95.0);
+        assert_eq!(track_length(&node, true), 15.0);
     }
 
     #[test]
