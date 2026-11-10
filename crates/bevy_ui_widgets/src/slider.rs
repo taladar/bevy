@@ -25,8 +25,8 @@ use bevy_picking::events::{Cancel, Drag, DragEnd, DragStart, Pointer, Press, Rel
 use bevy_picking::pointer::PointerButton;
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_ui::{
-    ComputedNode, ComputedUiRenderTargetInfo, InteractionDisabled, Pressed, UiGlobalTransform,
-    UiScale,
+    ComputedNode, ComputedUiRenderTargetInfo, InlineDirection, InteractionDisabled, Node, Pressed,
+    UiGlobalTransform, UiScale,
 };
 
 use crate::ValueChange;
@@ -56,6 +56,15 @@ impl SliderOrientation {
             SliderOrientation::Vertical => true,
         }
     }
+}
+
+/// Whether a slider's value runs from right to left: a horizontal slider whose node lays out
+/// right-to-left ([`Node::direction`]), the way a stylist places its thumb from the inline start.
+///
+/// The pointer and the arrow keys follow the thumb: a track click measures from the right edge, a
+/// drag to the left raises the value, and `ArrowLeft` steps up. A vertical slider is not mirrored.
+fn runs_right_to_left(is_vertical: bool, node: Option<&Node>) -> bool {
+    !is_vertical && node.is_some_and(|node| node.direction == InlineDirection::Rtl)
 }
 
 /// Defines how the slider should behave when you click on the track (not the thumb).
@@ -93,6 +102,11 @@ pub enum TrackClick {
 ///
 /// In cases where overhang is desired for artistic reasons, the thumb may have additional
 /// decorative child elements, absolutely positioned, which don't affect the size measurement.
+///
+/// A horizontal slider whose [`Node::direction`] is [`InlineDirection::Rtl`] runs from right to
+/// left: the stylist is expected to place the thumb from the right edge (the inline start), and a
+/// track click, a drag and the arrow keys all follow that, so the value under the pointer is the
+/// one the thumb would be drawn at.
 #[derive(Component, Debug, Default, Clone)]
 #[require(
     AccessibilityNode(accesskit::Node::new(Role::Slider)),
@@ -263,6 +277,7 @@ pub(crate) fn slider_on_pointer_down(
         &SliderStep,
         Option<&SliderPrecision>,
         &ComputedNode,
+        Option<&Node>,
         &ComputedUiRenderTargetInfo,
         &UiGlobalTransform,
         Has<InteractionDisabled>,
@@ -286,6 +301,7 @@ pub(crate) fn slider_on_pointer_down(
         step,
         precision,
         node,
+        layout,
         node_target,
         transform,
         disabled,
@@ -338,9 +354,14 @@ pub(crate) fn slider_on_pointer_down(
                 let adjusted_y = y_from_bottom - thumb_size / 2.0;
                 adjusted_y * range.span() / track_size + range.start()
             } else {
-                // For horizontal sliders: convert from center-origin to left-origin
-                let x_from_left = (normalized_pos.x + 0.5) * node.size().x;
-                let adjusted_x = x_from_left - thumb_size / 2.0;
+                // For horizontal sliders: convert from center-origin to an origin at the start
+                // edge, the left one, or the right one when the slider runs right to left.
+                let x_from_start = if runs_right_to_left(is_vertical, layout) {
+                    (0.5 - normalized_pos.x) * node.size().x
+                } else {
+                    (normalized_pos.x + 0.5) * node.size().x
+                };
+                let adjusted_x = x_from_start - thumb_size / 2.0;
                 adjusted_x * range.span() / track_size + range.start()
             }
         } else {
@@ -397,6 +418,7 @@ pub(crate) fn slider_on_drag(
         (
             &Slider,
             &ComputedNode,
+            Option<&Node>,
             &SliderRange,
             Option<&SliderPrecision>,
             &UiGlobalTransform,
@@ -413,7 +435,7 @@ pub(crate) fn slider_on_drag(
     if event.button != PointerButton::Primary {
         return;
     }
-    if let Ok((slider, node, range, precision, transform, drag, disabled)) =
+    if let Ok((slider, node, layout, range, precision, transform, drag, disabled)) =
         q_slider.get(event.entity)
     {
         event.propagate(false);
@@ -423,6 +445,7 @@ pub(crate) fn slider_on_drag(
                 event.entity,
                 slider,
                 node,
+                layout,
                 range,
                 precision,
                 transform,
@@ -444,6 +467,7 @@ pub(crate) fn slider_on_drag_end(
             Entity,
             &Slider,
             &ComputedNode,
+            Option<&Node>,
             &SliderRange,
             Option<&SliderPrecision>,
             &UiGlobalTransform,
@@ -460,7 +484,7 @@ pub(crate) fn slider_on_drag_end(
     if drag_end.button != PointerButton::Primary {
         return;
     }
-    if let Ok((slider_ent, slider, node, range, precision, transform, mut drag, disabled)) =
+    if let Ok((slider_ent, slider, node, layout, range, precision, transform, mut drag, disabled)) =
         q_slider.get_mut(drag_end.entity)
     {
         drag_end.propagate(false);
@@ -471,6 +495,7 @@ pub(crate) fn slider_on_drag_end(
                     drag_end.entity,
                     slider,
                     node,
+                    layout,
                     range,
                     precision,
                     transform,
@@ -493,6 +518,7 @@ fn emit_slider_drag_value_change(
     entity: Entity,
     slider: &Slider,
     node: &ComputedNode,
+    layout: Option<&Node>,
     range: &SliderRange,
     precision: Option<&SliderPrecision>,
     transform: &UiGlobalTransform,
@@ -529,7 +555,13 @@ fn emit_slider_drag_value_change(
         ((node.size().x - thumb_size) * node.inverse_scale_factor).max(1.0)
     };
 
-    let drag_distance = if is_vertical { distance.y } else { distance.x };
+    let drag_distance = if is_vertical {
+        distance.y
+    } else if runs_right_to_left(is_vertical, layout) {
+        -distance.x
+    } else {
+        distance.x
+    };
 
     let span = range.span();
     let new_value = if span > 0. {
@@ -581,23 +613,33 @@ fn slider_on_pointer_cancel(
 
 fn slider_on_key_input(
     mut focused_input: On<FocusedInput<KeyboardInput>>,
-    q_slider: Query<
-        (
-            &SliderValue,
-            &SliderRange,
-            &SliderStep,
-            Has<InteractionDisabled>,
-        ),
-        With<Slider>,
-    >,
+    q_slider: Query<(
+        &Slider,
+        &SliderValue,
+        &SliderRange,
+        &SliderStep,
+        Option<&ComputedNode>,
+        Option<&Node>,
+        Has<InteractionDisabled>,
+    )>,
     mut commands: Commands,
 ) {
-    if let Ok((value, range, step, disabled)) = q_slider.get(focused_input.focused_entity) {
+    if let Ok((slider, value, range, step, node, layout, disabled)) =
+        q_slider.get(focused_input.focused_entity)
+    {
         let input_event = &focused_input.input;
         if !disabled && input_event.state == ButtonState::Pressed {
+            // The arrow keys step toward the side they point at, so they swap on a slider that
+            // runs right to left.
+            let is_vertical = node.is_some_and(|node| slider.orientation.is_vertical(node));
+            let right_step = if runs_right_to_left(is_vertical, layout) {
+                -step.0
+            } else {
+                step.0
+            };
             let new_value = match input_event.key_code {
-                KeyCode::ArrowLeft => range.clamp(value.0 - step.0),
-                KeyCode::ArrowRight => range.clamp(value.0 + step.0),
+                KeyCode::ArrowLeft => range.clamp(value.0 - right_step),
+                KeyCode::ArrowRight => range.clamp(value.0 + right_step),
                 KeyCode::Home => range.start(),
                 KeyCode::End => range.end(),
                 _ => {
@@ -759,6 +801,19 @@ impl Plugin for SliderPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_horizontal_right_to_left_slider_is_mirrored() {
+        let rtl = Node {
+            direction: InlineDirection::Rtl,
+            ..Default::default()
+        };
+        let ltr = Node::default();
+        assert!(runs_right_to_left(false, Some(&rtl)));
+        assert!(!runs_right_to_left(true, Some(&rtl)));
+        assert!(!runs_right_to_left(false, Some(&ltr)));
+        assert!(!runs_right_to_left(false, None));
+    }
 
     #[test]
     fn test_slider_precision_rounding() {
